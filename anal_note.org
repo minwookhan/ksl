@@ -130,8 +130,6 @@ message SubmitResultResponse {
 
 * AIThread
 ** gemini-web
-*** AIThread 실행 흐름 분석 (CgRPCFileClientDlg::AIThread)
-
 `AIThread`는 메인 로직(비디오 재생 또는 gRPC 전송 스레드)으로부터 영상 데이터가 준비되었다는 신호를 받으면, 내장된 Python 인터프리터를 통해 MediaPipe 로직을 수행하고 결과를 C++ 구조체에 저장합니다.
 
 **** 1. 실행 대기 및 시작 신호 수신 (Wait for Signal)
@@ -396,3 +394,419 @@ void gRPCFileClient::StreamSentenceAnalyze()
 *** 6. 스레드 종료
 `AIProcessingThread::Run()` 함수의 루프가 모두 끝나고 `grpc_client->WritesDone()`이 호출되면, `gRPCFileClient`의 읽기 스레드도 서버로부터 스트림 종료 신호를 받고 종료됩니다. 결과적으로 `AIProcessingThread::Run()` 함수가 반환되고, `InitInstance()`도 종료되면서 `AIThread`는 모든 작업을 마치고 소멸합니다.
 ```
+* 손동작 인식
+** gemini-cli
+*** 개요
+MediaPipe Hands는 모바일, 데스크톱, 웹 등 다양한 플랫폼에서 실시간으로 손과 손가락을 추적하는 고성능 솔루션입니다. 핵심 기능은 한 손에 대해 **21개의 3D 랜드마크(Landmark)**를 감지하는 것입니다.
+
+알고리즘의 핵심 아이디어는 **"먼저 넓은 영역에서 손바닥을 찾고, 그 다음에 찾은 영역 내에서 정밀하게 랜드마크를 찾는다"**는 2단계 접근 방식을 사용하여 정확도와 속도를 모두 확보하는 것입니다.
+*** 핵심 알고리즘: 2단계 파이프라인 (Two-Stage Pipeline)
+
+**** 1단계: 손바닥 감지 모델 (Palm Detection Model)
+   이 단계의 목표는 전체 이미지에서 손이 어디에 있는지를 빠르고 가볍게 찾아내는 것입니다.
+
+   - **역할**: 이미지 전체에서 손바닥 영역을 찾아 사각 영역(Bounding Box)으로 위치를 특정합니다.
+   - **입력**: 전체 비디오 프레임 (예: 640x480 이미지)
+   - **사용 모델**: BlazePalm 이라는 가벼운 단일 샷(Single-Shot) 감지 모델을 사용합니다. 이 모델은 모바일 GPU에서도 실시간으로 동작하도록 최적화되어 있습니다.
+   - **출력**: 손바닥을 감싸는 회전된 사각 영역(Rotated Bounding Box)과 감지 신뢰도(Confidence Score).
+   - **특징**:
+     - 주먹을 쥔 손, 활짝 편 손, 장갑을 낀 손 등 다양한 형태의 손을 감지할 수 있습니다.
+     - 손가락까지 모두 포함하는 대신, 손바닥 영역에 집중하여 모델 크기를 줄이고 속도를 높였습니다.
+
+#+BEGIN_SRC text
++--------------------------------------+
+|                                      |
+|      +-------+                       |
+|      |       |  <-- 1. BlazePalm이   |
+|      | Palm  |      손바닥 영역 감지 |
+|      | BBox  |                       |
+|      +-------+                       |
+|                                      |
++--------------------------------------+
+        전체 이미지 프레임
+#+END_SRC
+
+**** 2단계: 손 랜드마크 모델 (Hand Landmark Model)
+   1단계에서 찾은 손바닥 영역 내에서 21개의 정밀한 관절 위치를 찾아냅니다.
+
+   - **역할**: 감지된 손바닥 영역 이미지 내에서 21개의 3D 랜드마크 좌표를 추정합니다.
+   - **입력**: 1단계에서 찾은 손바닥 영역을 잘라내고, 손목 방향에 맞춰 회전 및 정규화한 작은 이미지.
+   - **사용 모델**: 1단계 모델보다 더 무겁고 정밀한 리그레션(Regression) 기반 모델을 사용합니다.
+   - **출력**:
+     1. **21개의 3D 랜드마크 좌표 (x, y, z)**:
+        - `x`, `y`: 이미지 내의 정규화된 좌표 (0.0 ~ 1.0).
+        - `z`: 손목(Wrist, 랜드마크 0번)을 기준으로 한 상대적인 깊이. `z`값이 작을수록 카메라에 가깝습니다.
+     2. **왼손/오른손 판별 (Handedness)**: 감지된 손이 왼손인지 오른손인지에 대한 신뢰도.
+     3. **랜드마크 감지 신뢰도 (Confidence Score)**.
+
+#+BEGIN_SRC text
++-------+
+| .   . |
+|  . .  |  <-- 2. 랜드마크 모델이
+| .   . |      21개 관절 위치 추정
+|  . .  |
++-------+
+ 잘라낸 손바닥 이미지
+#+END_SRC
+
+*** 알고리즘의 연속성 및 최적화 (Tracking & Optimization)
+비디오처럼 연속된 프레임에서는 매번 1단계(손바닥 감지)를 실행하지 않고, 다음과 같은 최적화 과정을 거칩니다.
+
+1.  **첫 프레임**: 1단계(Palm Detection)를 실행하여 손의 위치를 찾고, 그 결과로 2단계(Landmark Model)를 실행하여 21개 랜드마크를 찾습니다.
+2.  **다음 프레임부터**: 이전 프레임에서 찾은 **랜드마크들을 기반으로** 현재 프레임의 손바닥 위치를 추정합니다. 그리고 바로 2단계(Landmark Model)를 실행합니다.
+3.  **추적 실패 시**: 만약 2단계에서 랜드마크를 찾는 데 실패하거나 신뢰도가 특정 임계값 아래로 떨어지면 (예: 손이 너무 빨리 움직이거나 화면 밖으로 나갔을 때), 알고리즘은 추적에 실패했다고 판단하고 다시 1단계(Palm Detection)를 전체 프레임에 대해 실행하여 손의 위치를 찾습니다.
+
+이러한 방식 덕분에 무거운 손바닥 감지 모델을 매 프레임마다 실행할 필요가 없어져서 계산 비용이 크게 줄어들고, 실시간 추적이 가능해집니다.
+
+*** 3단계: 랜드마크를 제스처로 해석하기 (From Landmarks to Gestures)
+MediaPipe는 21개 랜드마크의 '위치'를 제공할 뿐, "이것이 '주먹'이다" 또는 "'V' 사인이다"라고 직접 알려주지는 않습니다. 랜드마크 좌표를 실제 제스처로 해석하는 로직은 개발자가 직접 구현해야 합니다.
+
+**** 방법 1: 기하학적 규칙 기반 (Rule-Based Geometric Approach)
+   랜드마크 간의 각도나 거리를 계산하여 규칙을 만듭니다.
+
+   - **예시: "검지 손가락이 펴졌는가?"**
+     - 손목(0), 검지 시작(5), 검지 중간(6), 검지 끝(8) 랜드마크를 이용합니다.
+     - 벡터 (5 -> 6)과 벡터 (6 -> 8) 사이의 각도를 계산합니다.
+     - 이 각도가 160~180도에 가까우면 "펴진 상태"로 판단할 수 있습니다.
+     - `is_finger_straight = angle(vec(5,6), vec(6,8)) > 160`
+
+   - **예시: "주먹을 쥐었는가?"**
+     - 모든 손가락 끝(4, 8, 12, 16, 20)이 손바닥 중심(예: 0번 랜드마크)과 특정 거리 이하로 가까워졌는지 확인합니다.
+
+**** 방법 2: 머신러닝 모델 기반 (Machine Learning Approach)
+   더 복잡하고 다양한 제스처를 인식하기 위해, 랜드마크 데이터를 입력으로 하는 별도의 분류(Classification) 모델을 학습시킵니다.
+
+   1.  **데이터 수집**: '주먹', 'V 사인', 'OK' 등 인식하고자 하는 각 제스처에 대한 랜드마크 데이터를 수집하고 라벨링합니다.
+   2.  **특징 추출 (Feature Engineering)**:
+       - 21개 랜드마크의 (x, y, z) 좌표를 그대로 사용하거나,
+       - 손목(0번)을 원점으로 하여 모든 좌표를 상대적으로 변환하고,
+       - 손 크기에 대해 정규화(Normalization)하여 특징 벡터(Feature Vector)를 만듭니다.
+   3.  **모델 학습**: 준비된 특징 벡터와 라벨을 사용하여 SVM(Support Vector Machine), RandomForest, 또는 간단한 신경망(MLP) 같은 분류 모델을 학습시킵니다.
+   4.  **추론**: 실시간으로 MediaPipe에서 얻은 랜드마크 데이터로 특징 벡터를 만들어 학습된 모델에 입력하면, 어떤 제스처인지 분류된 결과가 나옵니다.
+** chatgpt
+*** MediaPipe 기반 손동작 인식 전체 흐름
+
+**** 1. 입력 영상과 ROI 준비 단계
+
+*** OpenCV `VideoCapture` 로 CCTV/영상 프레임 읽기
+*** 전체 프레임에서 사용자 지정 ROI(rect) 잘라서 `m_cap_img` 에 저장
+*** `m_cap_img` 변수
+
+  * AI 스레드와 공유되는 현재 프레임의 관심 영역 이미지 버퍼 역할
+
+**** 2. AIThread 스레드와 pybind11 초기화
+
+*** `CgRPCFileClientDlg::AIThread(LPVOID pParam)`
+
+  * 별도 CWinThread 로 동작하는 AI 전용 스레드
+  * 메인 다이얼로그 포인터 `pDlg` 사용
+*** 동기화 이벤트
+
+  * `HANDLE hAIStart`
+
+    * 메인 쪽에서 AI 분석 시작 신호 전달용 이벤트
+  * `HANDLE hAIFinish`
+
+    * AIThread 가 분석 완료를 알리는 이벤트
+*** Python 임베딩 초기화
+
+  * `pybind11::scoped_interpreter guard{}` 로 내장 Python 인터프리터 초기화
+  * AIThread 수명 동안 Python 런타임 유지
+
+**** 3. Python MediaPipe 함수 호출 단계
+
+*** Python 모듈 로딩
+
+  * `auto exampleModule4 = pybind11::module_::import("ACR.mp_detect");`
+  * C++ 에서 `ACR/mp_detect.py` 모듈 직접 임포트
+*** MediaPipe 관련 함수 포인터 획득
+
+  * `auto func_mp_pose = exampleModule4.attr("mediapipe_pose_func");`
+  * `auto func_mp_hand = exampleModule4.attr("mediapipe_hand_func");`
+  * 포즈 전체(몸·손)와 손 전용 인식 함수 분리 구조
+*** 이벤트 기반 호출 루프
+
+  * `while (pDlg->m_exit.load() == 0)` 루프
+  * `WaitForSingleObject(pDlg->hAIStart, INFINITE)`
+
+    * 메인 쓰레드가 `SetEvent(hAIStart)` 호출할 때까지 대기
+*** 입력 이미지 준비
+
+  * `dst_img = pDlg->m_cap_img.clone()`
+  * 채널 수 4인 경우 `cvtColor(dst_img, dst_img, COLOR_BGRA2BGR)`
+
+    * BGRA → BGR 변환으로 MediaPipe 입력 포맷 정규화
+*** MediaPipe 포즈 함수 호출
+
+  * `auto result_pose_mp = func_mp_pose(pybind11::cast(dst_img));`
+
+    * OpenCV `cv::Mat` → pybind11 `array` 캐스팅 후 Python 함수 인자 전달
+  * `auto mp_result = result_pose_mp.cast<std::vector<std::vector<double>>>();`
+
+    * Python 반환값을 `std::vector<std::vector<double>>` 로 역캐스팅
+    * 3×N 형식 (x 배열, y 배열, z 배열) 구조 가정 가능
+
+**** 4. MediaPipe 결과를 3D 스켈레톤으로 변환·저장
+
+*** 스켈레톤 버퍼 초기화
+
+  * `pDlg->m_sgcp_vtSkeletonMP.clear();`
+  * 현재 프레임의 스켈레톤 포인트 벡터 비우기
+*** 3D 포인트 생성 로직
+
+  * 조건: `mp_result.size() >= 3` (x, y, z 세 행 이상 존재 시)
+  * 루프
+
+    * `for (int k = 0; k < mp_result[0].size(); k++)`
+    * `Point3f(mp_result[0][k], mp_result[1][k], mp_result[2][k])`
+    * 3D 관절 좌표를 `cv::Point3f` 로 생성 후 `m_sgcp_vtSkeletonMP` 에 `push_back`
+*** 의미
+
+  * `m_sgcp_vtSkeletonMP`
+
+    * MediaPipe 출력 3D 스켈레톤(몸·손 관절)의 내부 표현
+    * 이후 손 위치/동작 판단 및 gRPC 전송에 공통 사용
+  * proto 정의 상 `Point3` 메시지
+
+    * `float x`, `float y`, `float z`
+    * MediaPipe 스켈레톤 포인트를 네트워크로 전송하기 위한 공용 데이터 구조 역할
+
+**** 5. 2D 손 위치 추출 및 거친 손 상태 판단
+
+*** 참조 손 위치 계산 함수
+
+  * `std::vector<Point2f> GetRefHL2DPointsMP(std::vector<cv::Point3f> joints)`
+  * `joints.size() <= 0` 인 경우 빈 벡터 반환
+  * 3D 스켈레톤 각 점을 2D 픽셀 좌표로 변환
+  * 왼손·오른손 기준 위치 두 점(인덱스 0: Left, 1: Right) 추출 용도
+*** 거친 손 상태 판별 함수
+
+  * `int GetRoughHandStatusFromMP(std::vector<Point3f> mp_pose)`
+  * 초기값 `status = -1`
+
+    * 입력 포즈 없음 → 에러 상태 -1 반환
+  * 처리 흐름
+
+    * `auto hl = GetRefHL2DPointsMP(mp_pose);`
+    * `hl[0]`, `hl[1]` 의 y 좌표와 `READY_LOCATION` 상수 비교
+  * 상태 코드
+
+    * `status = 3`
+
+      * 두 손 y ≤ READY_LOCATION
+      * 양손 모두 준비선 위 위치
+    * `status = 1`
+
+      * 오른손만 READY_LOCATION 위, 왼손은 아래
+    * `status = 2`
+
+      * 왼손만 READY_LOCATION 위, 오른손은 아래
+    * `status = 0`
+
+      * 양손 모두 READY_LOCATION 아래 (손 내림 상태)
+
+**** 6. 프레임 간 스켈레톤 변화를 이용한 손동작(모션) 상태 추적
+
+*** 함수 시그니처
+
+  * `int GetMotionStatusFromMP(int cur_motion_status, std::vector<cv::Point3f> cur_mp)`
+*** 내부 상태 보관
+
+  * `static std::vector<cv::Point3f> prev_mp;`
+  * 이전 프레임의 3D 스켈레톤 유지
+*** 리셋 처리
+
+  * `cur_motion_status == RESET_MOTION_STATUS` 인 경우
+
+    * `prev_mp.clear()`
+    * 그대로 `RESET_MOTION_STATUS` 반환
+    * 상태 초기화 및 히스토리 삭제 동작
+*** 첫 프레임 처리
+
+  * `prev_mp.size() <= 0` 인 경우
+
+    * `prev_mp = cur_mp`
+    * `READY_MOTION_STATUS` 반환
+    * 모션 상태 초기값 준비 상태로 설정
+*** 손 이동 거리 계산
+
+  * 오른손 기준
+
+    * `Rdev = m_util.Distance(Point2f(prev_mp[16].x - cur_mp[16].x, prev_mp[16].y - cur_mp[16].y));`
+  * 왼손 기준
+
+    * `Ldev = m_util.Distance(Point2f(prev_mp[15].x - cur_mp[15].x, prev_mp[15].y - cur_mp[15].y));`
+  * 의미
+
+    * MediaPipe 스켈레톤에서 특정 관절 인덱스(15, 16)를 손 대표 포인트로 사용
+    * 이전 프레임과의 거리로 손 움직임 크기 측정
+*** 급격한 움직임 판정
+
+  * 조건: `Rdev > RAPID_DISTANCE || Ldev > RAPID_DISTANCE`
+  * 만족 시 즉시 `RAPID_MOTION_STATUS` 반환
+  * 손이 빠르게 크게 이동한 제스처 구간 표시 용도
+*** 상태 머신 로직
+
+  * 현재 상태 `cur_motion_status == READY_MOTION_STATUS` 인 경우
+
+    * `int hand_status = GetRoughHandStatusFromMP(cur_mp);`
+    * `hand_status > 0` 이면 `motion_status = SPEAK_MOTION_STATUS`
+    * 손이 “말하기(표현)”를 시작한 상태로 전이
+  * 현재 상태 `cur_motion_status == SPEAK_MOTION_STATUS` 인 경우
+
+    * `prev_mp.size() > 0 && cur_mp.size() > 0` 조건 하에서
+    * `motion_status = READY_MOTION_STATUS` 로 복귀
+    * 특정 조건 만족 시 동작 종료 후 다시 준비 상태로 돌아가는 구조
+*** 마지막 업데이트
+
+  * `prev_mp = cur_mp;`
+  * 최신 프레임 스켈레톤을 다음 프레임 비교 기준으로 저장
+  * 반환값 `motion_status`
+
+    * READY / SPEAK / RAPID / RESET 등 손동작 상태 코드
+
+**** 7. Optical Flow 와의 결합에 의한 손동작 구간 강화
+
+*** Optical Flow 기반 전체 모션 값
+
+  * `double GetMotionVauleWithOpticalFlow(...)` 계열 함수
+  * ROI 내부 특징점 추출(`goodFeaturesToTrack`) 후
+  * `calcOpticalFlowPyrLK` 으로 특징점 이동 거리 평균 계산
+  * 결과 `avgMotion` 값 출력
+*** 손동작 인식 신뢰도 향상
+
+  * MediaPipe 스켈레톤 기반
+
+    * `GetRoughHandStatusFromMP` → 손 유무, 어느 손인지
+    * `GetMotionStatusFromMP` → READY/SPEAK/RAPID 등 동작 상태
+  * Optical Flow 기반
+
+    * 손 주변 전체 픽셀 수준 움직임 크기
+  * 두 정보 결합
+
+    * 손 스켈레톤이 크게 변하고
+    * Optical Flow 모션이 일정 임계 이상이거나, 이후 정지 구간으로 떨어지는 시점
+    * 의미 있는 손동작(발화 구간, 분절점) 후보 프레임 검출 로직에 사용
+
+**** 8. 손동작 인식 결과의 최종 활용
+
+*** `m_sgcp_vtSkeletonMP`
+
+  * MediaPipe 3D 포즈 결과 저장 버퍼
+  * gRPC `Frame` 메시지의 `pose_points` 필드로 매핑
+  * 서버 측 문장 인식/손동작 분석 모델의 입력 역할
+*** `GetRoughHandStatusFromMP` / `GetMotionStatusFromMP`
+
+  * 클라이언트 내부에서
+
+    * 손 존재 여부
+    * 왼손/오른손 구분
+    * 동작 상태(준비/발화/급격한 모션 등) 판단
+  * 키프레임 전송 조건, UI 정보 표시, 디버깅 로그 등에 활용 가능성
+
+이 구조 기준으로 보면,
+
+*** MediaPipe 역할: 각 프레임에서 3D 스켈레톤(손 포함) 좌표 추출
+*** C++/OpenCV 역할: ROI 자르기, Python 호출, Optical Flow 계산
+*** 손동작 인식 핵심:
+
+  * 스켈레톤 기반 손 위치·상태(READY/SPEAK/RAPID) 판정
+  * Optical Flow 기반 전체 모션 크기와 결합하여 의미 있는 손동작 구간 추출
+** gemini-web
+*** AIThread 실행 흐름 분석 (CgRPCFileClientDlg::AIThread)
+
+`AIThread`는 메인 로직(비디오 재생 또는 gRPC 전송 스레드)으로부터 영상 데이터가 준비되었다는 신호를 받으면, 내장된 Python 인터프리터를 통해 MediaPipe 로직을 수행하고 결과를 C++ 구조체에 저장합니다.
+
+**** 1. 실행 대기 및 시작 신호 수신 (Wait for Signal)
+   AI 스레드는 무한 루프 내에서 `hAIStart` 이벤트가 발생하기를 대기합니다. 이 이벤트는 메인 스레드나 비디오 스레드에서 `SetEvent(hAIStart)`를 호출할 때 활성화됩니다.
+   - `WaitForSingleObject`: CPU 자원을 소모하지 않고 대기 상태로 머뭅니다.
+   - `pDlg->m_cap_img`: 분석할 이미지가 비어있는지 안전 장치로 확인합니다.
+
+   #+BEGIN_SRC cpp
+   // gRPCFileClientDlg.cpp : AIThread 내부 Loop
+
+   while (pDlg->m_exit.load() == 0)
+   {
+       // hAIStart 이벤트가 SetEvent 될 때까지 대기
+       WaitForSingleObject(pDlg->hAIStart, INFINITE);
+
+       // 영상 데이터가 비어있지 않은 경우에만 로직 수행
+       if (!pDlg->m_cap_img.empty())
+       {
+           // ... (이후 로직 진행)
+       }
+       // ...
+   }
+   #+END_SRC
+
+
+**** 2. 이미지 전처리 (Preprocessing)
+   원본 이미지를 복제하고, Python 라이브러리(MediaPipe)가 처리하기 적합한 포맷으로 변환합니다.
+   - `clone()`: 원본 `m_cap_img`가 다른 스레드(비디오 재생 등)에서 동시에 변경될 수 있으므로, 반드시 깊은 복사를 수행하여 스레드 안전성을 확보합니다.
+   - `cvtColor`: OpenCV의 기본인 4채널(BGRA) 이미지인 경우 3채널(BGR)로 변환합니다.
+
+   #+BEGIN_SRC cpp
+   // 이미지 깊은 복사
+   cv::Mat dst_img = pDlg->m_cap_img.clone();
+
+   // 4채널(투명도 포함)인 경우 3채널로 변환
+   if (dst_img.channels() == 4)
+       cvtColor(dst_img, dst_img, COLOR_BGRA2BGR);
+   #+END_SRC
+
+
+**** 3. Python 함수 호출 및 추론 (Python Inference)
+   `pybind11`을 사용하여 C++의 `cv::Mat`을 Python 객체로 변환하고, 스레드 초기화 시점에 로드해둔 Python 함수(`func_mp_pose`)를 호출합니다.
+   - `pybind11::cast(dst_img)`: OpenCV Mat 데이터를 Python `numpy.ndarray`로 자동 변환하여 인자로 전달합니다.
+   - `func_mp_pose(...)`: Python 영역(`ACR.mp_detect` 모듈)의 MediaPipe Pose 추론을 실행하고 결과를 반환받습니다.
+
+   #+BEGIN_SRC cpp
+   // Python 함수 호출 (이미지 전달 및 추론 실행)
+   auto result_pose_mp = func_mp_pose(pybind11::cast(dst_img));
+   #+END_SRC
+
+
+**** 4. 결과 데이터 파싱 (Result Parsing)
+   Python 리턴값을 C++ 데이터 타입으로 변환하고, 결과를 저장할 멤버 변수 벡터를 초기화합니다.
+   - 반환값 구조: Python List `[[x1, x2...], [y1, y2...], [z1, z2...]]` 형태.
+   - `cast<...>`: Python 객체를 C++의 `std::vector<std::vector<double>>` 타입으로 캐스팅합니다.
+
+   #+BEGIN_SRC cpp
+   // Python 반환값을 C++ 이중 벡터로 변환
+   auto mp_result = result_pose_mp.cast<std::vector<std::vector <double>>>();
+
+   // 기존에 저장된 스켈레톤 데이터 초기화
+   pDlg->m_sgcp_vtSkeletonMP.clear();
+   #+END_SRC
+
+
+**** 5. 관절 좌표 저장 (Store Skeleton Data)
+   파싱된 좌표 데이터를 순회하며 `Point3f` 객체로 생성하여 최종 저장합니다.
+   - `mp_result[0]`: X 좌표 리스트
+   - `mp_result[1]`: Y 좌표 리스트
+   - `mp_result[2]`: Z 좌표 리스트
+   - 위 3개 리스트의 같은 인덱스(`k`)를 조합하여 하나의 3D 좌표(`Point3f`)를 만듭니다.
+
+   #+BEGIN_SRC cpp
+   // 데이터 유효성 검사 (X, Y, Z 축 데이터가 모두 있는지)
+   if (mp_result.size() >= 3)
+   {
+       // 랜드마크 개수만큼 반복
+       for (int k = 0; k < mp_result[0].size(); k++)
+       {
+           // x, y, z 좌표를 묶어 Point3f로 저장
+           pDlg->m_sgcp_vtSkeletonMP.push_back(
+               Point3f(mp_result[0][k], mp_result[1][k], mp_result[2][k])
+           );
+       }
+   }
+   #+END_SRC
+
+
+**** 6. 완료 신호 전송 (Signal Completion)
+   모든 처리가 완료되었음을 알리는 이벤트를 발생시킵니다. 이를 통해 `WaitForSingleObject(hAIFinish)`로 대기 중이던 메인 로직(전송 스레드 등)이 깨어나 다음 단계(gRPC 전송 등)를 진행하게 됩니다.
+
+   #+BEGIN_SRC cpp
+   // 처리 완료 신호 발생
+   SetEvent(pDlg->hAIFinish);
+   #+END_SRC
