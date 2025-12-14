@@ -38,7 +38,7 @@ message SubmitResultResponse {
 
 #+end_src
 #+begin_src markdown
-**`ksl_sentence_recognition.proto` 파일에 정의된 데이터 구조 및 역할:**
+* ksl_sentence_recognition.proto` 파일에 정의된 데이터 구조 및 역할:**
 
 1.  **`Point3` 메시지**
     *   **구조**: `float x`, `float y`, `float z` 세 개의 부동 소수점 필드를 가집니다.
@@ -64,3 +64,335 @@ message SubmitResultResponse {
     *   **역할**: gRPC 서버가 클라이언트에게 수어 인식 처리 결과를 반환할 때 사용하는 메시지입니다. 어떤 세션에 대한 응답인지, 몇 개의 프레임이 처리되었는지, 그리고 가장 중요한 인식된 수어 문장이 무엇인지를 클라이언트에게 전달합니다.
 
 #+end_src
+
+* 전체 흐름
+#+TITLE: 프로젝트 설명
+** 1. 파일 개요
+*** `gRPCFileClient.cpp` / `gRPCFileClient.h`
+   이 파일들은 gRPC 클라이언트의 핵심 로직을 포함합니다. gRPC 서비스 호출을 오케스트레이션하고, 애플리케이션의 전반적인 상태 관리 및 비디오 처리와 gRPC 통신 간의 조정을 담당합니다.
+*** `gRPCFileClientDlg.cpp` / `gRPCFileClientDlg.h`
+   MFC(Microsoft Foundation Classes) 기반의 다이얼로그 및 UI 흐름을 정의합니다. 사용자 인터페이스를 관리하고, 사용자 입력(예: 파일 선택, 버튼 클릭)을 처리하며, gRPC 통신 결과를 화면에 표시하는 역할을 합니다.
+*** `framework.h`
+   MFC 및 Windows 애플리케이션의 공통 헤더 파일을 포함하여 프로젝트 전반에 걸쳐 필요한 기본 프레임워크 정의를 제공합니다.
+*** `pch.cpp` / `pch.h`
+   미리 컴파일된 헤더(Precompiled Header) 파일로, 빌드 시간을 단축하기 위해 자주 변경되지 않는 헤더들을 미리 컴파일하여 관리합니다.
+*** `resource.h`
+   Windows 애플리케이션의 UI 요소(아이콘, 메뉴, 다이얼로그 템플릿 등)에 대한 리소스 ID를 정의합니다.
+*** `targetver.h`
+   애플리케이션이 대상으로 하는 Windows 운영 체제 버전을 정의합니다.
+*** `ksl_sentence_recognition.proto`
+   gRPC 서비스의 계약(Service Contract)과 서버-클라이언트 간에 교환될 데이터 메시지 구조를 정의하는 프로토콜 버퍼 정의 파일입니다.
+*** `ksl_sentence_recognition.grpc.pb.cc` / `ksl_sentence_recognition.grpc.pb.h`
+   `ksl_sentence_recognition.proto` 파일로부터 자동으로 생성된 C++ 코드입니다. gRPC 클라이언트 스텁(Stub)과 서비스 인터페이스를 제공하여 서버와의 통신을 가능하게 합니다.
+*** `ksl_sentence_recognition.pb.cc` / `ksl_sentence_recognition.pb.h`
+   `ksl_sentence_recognition.proto` 파일로부터 자동으로 생성된 C++ 코드입니다. 프로토콜 버퍼 메시지 클래스들을 정의하여 데이터의 직렬화 및 역직렬화를 처리합니다.
+*** `VideoUtil-v1.1.cpp` / `VideoUtil-v1.1.h`
+   비디오 파일에서 프레임을 읽고, 디코딩하며, 필요한 전처리 작업을 수행하는 등의 비디오 처리 유틸리티 함수와 클래스를 제공합니다.
+*** `HandTurnDetector.hpp`
+   비디오 프레임 내에서 손의 움직임이나 방향 전환을 감지하는 데 사용되는 헬퍼 함수 또는 클래스를 정의합니다. 이는 비디오 전처리 단계의 일부일 수 있습니다.
+*** `gRPCThread_.h`
+   비동기 gRPC 통신이나 시간이 오래 걸리는 비디오 처리 작업을 백그라운드에서 수행하기 위한 스레드 관리 헬퍼 클래스 또는 함수를 포함합니다.
+
+** 2. 진입점
+*** `WinMain` (애플리케이션 진입점)
+   `gRPCFileClientDlg.cpp`의 `#pragma comment(linker, "/entry:WinMainCRTStartup /subsystem:console")` 지시자를 통해 `WinMainCRTStartup`이 시작됩니다. 실질적인 MFC 애플리케이션의 초기화는 `gRPCFileClient.cpp`의 `CgRPCFileClientApp::InitInstance()` 함수에서 이루어지며, 여기서 메인 다이얼로그(`CgRPCFileClientDlg`)를 생성하고 실행합니다.
+*** 다이얼로그 (UI 진입점)
+   `CgRPCFileClientDlg`는 사용자 인터페이스의 주요 진입점이며, 사용자 입력(예: 파일 선택, 시작/정지 버튼 클릭)을 처리합니다.
+*** 스레드 (비동기 처리 진입점)
+   `gRPCThread_.h`에 정의된 스레드 관련 클래스/함수들은 백그라운드에서 비디오 처리나 gRPC 통신과 같은 시간이 오래 걸리는 작업을 비동기적으로 수행하는 진입점을 제공합니다.
+
+** 3. 아키텍처 요약
+*** UI 계층 (UI Layer)
+   `gRPCFileClientDlg.cpp/.h`를 중심으로 MFC(Microsoft Foundation Classes)를 사용하여 사용자 인터페이스를 구성합니다. 사용자의 입력(예: 비디오 파일 선택, 분석 시작/중지)을 받고, gRPC 통신 결과를 화면에 표시하는 역할을 합니다. `framework.h`, `resource.h` 등이 이 계층을 지원합니다.
+*** gRPC 통신 계층 (gRPC Communication Layer)
+   `ksl_sentence_recognition.proto`에 정의된 프로토콜을 기반으로 서버와 통신합니다. `ksl_sentence_recognition*.pb.{h,cc}` 파일들은 프로토콜 버퍼 메시지와 gRPC 클라이언트 스텁을 제공하며, `gRPCFileClient.cpp/.h`의 핵심 로직이 이 스텁을 사용하여 서버에 요청을 보내고 응답을 처리합니다.
+*** 비디오/전처리 계층 (Video/Preprocessing Layer)
+   `VideoUtil-v1.1.cpp/.h`는 비디오 파일을 읽고 프레임을 추출하는 등의 비디오 처리 유틸리티를 제공합니다. `HandTurnDetector.hpp`는 비디오 프레임에서 특정 제스처나 특징을 감지하는 전처리 로직을 포함할 수 있습니다. 이 계층은 gRPC 서버로 전송될 데이터를 준비합니다.
+*** ACR / AI 모듈 통합 (ACR / AI Module Integration)
+   클라이언트 자체에 ACR(Automated Content Recognition) 또는 AI 모듈이 직접 포함되어 있지는 않습니다. 대신, 클라이언트는 gRPC 통신 계층을 통해 원격 서버에 위치한 ACR/AI 모듈에 비디오 데이터를 전송하고, 서버에서 처리된 결과를 받아오는 방식으로 통합됩니다. 즉, 클라이언트는 AI 서비스의 '소비자' 역할을 합니다.
+
+** 4. 데이터 흐름도
+1.  **사용자 액션 (User Action)**: 사용자가 `CgRPCFileClientDlg` UI에서 비디오 파일을 선택하고 "분석 시작" 버튼을 클릭합니다.
+2.  **내부 로직 (Internal Logic)**:
+    *   `CgRPCFileClientDlg`는 사용자 액션을 감지하고, `gRPCFileClient`의 관련 함수를 호출합니다.
+    *   `gRPCFileClient`는 `VideoUtil-v1.1`을 사용하여 선택된 비디오 파일에서 프레임을 읽고, 필요에 따라 `HandTurnDetector`를 통해 전처리합니다.
+    *   이 과정은 `gRPCThread_.h`에 정의된 스레드를 통해 백그라운드에서 비동기적으로 수행될 수 있습니다.
+3.  **gRPC 요청 (gRPC Request)**:
+    *   처리된 비디오 프레임 데이터는 `ksl_sentence_recognition.proto`에 정의된 메시지 형식으로 변환됩니다.
+    *   `gRPCFileClient`는 생성된 gRPC 클라이언트 스텁(`ksl_sentence_recognition.grpc.pb.h`에 정의)을 사용하여 원격 gRPC 서버로 비디오 데이터와 함께 분석 요청을 보냅니다.
+4.  **서버 응답 (Server Response)**:
+    *   gRPC 서버는 요청을 받아 ACR/AI 모듈로 비디오 데이터를 전달하여 분석을 수행합니다.
+    *   분석 결과(예: 인식된 수어 문장, 제스처 정보)는 다시 `ksl_sentence_recognition.proto`에 정의된 응답 메시지 형식으로 클라이언트에 반환됩니다.
+5.  **UI 업데이트 (UI Update)**:
+    *   `gRPCFileClient`는 서버로부터 받은 gRPC 응답을 처리합니다.
+    *   처리된 결과는 `CgRPCFileClientDlg`로 전달되어, UI에 인식된 문장, 진행 상황 또는 기타 관련 정보를 표시하여 사용자에게 피드백을 제공합니다.
+```
+
+* AIThread
+** gemini-web
+*** AIThread 실행 흐름 분석 (CgRPCFileClientDlg::AIThread)
+
+`AIThread`는 메인 로직(비디오 재생 또는 gRPC 전송 스레드)으로부터 영상 데이터가 준비되었다는 신호를 받으면, 내장된 Python 인터프리터를 통해 MediaPipe 로직을 수행하고 결과를 C++ 구조체에 저장합니다.
+
+**** 1. 실행 대기 및 시작 신호 수신 (Wait for Signal)
+   AI 스레드는 무한 루프 내에서 `hAIStart` 이벤트가 발생하기를 대기합니다. 이 이벤트는 메인 스레드나 비디오 스레드에서 `SetEvent(hAIStart)`를 호출할 때 활성화됩니다.
+   - `WaitForSingleObject`: CPU 자원을 소모하지 않고 대기 상태로 머뭅니다.
+   - `pDlg->m_cap_img`: 분석할 이미지가 비어있는지 안전 장치로 확인합니다.
+
+   #+BEGIN_SRC cpp
+   // gRPCFileClientDlg.cpp : AIThread 내부 Loop
+
+   while (pDlg->m_exit.load() == 0)
+   {
+       // hAIStart 이벤트가 SetEvent 될 때까지 대기
+       WaitForSingleObject(pDlg->hAIStart, INFINITE);
+
+       // 영상 데이터가 비어있지 않은 경우에만 로직 수행
+       if (!pDlg->m_cap_img.empty())
+       {
+           // ... (이후 로직 진행)
+       }
+       // ...
+   }
+   #+END_SRC
+
+
+**** 2. 이미지 전처리 (Preprocessing)
+   원본 이미지를 복제하고, Python 라이브러리(MediaPipe)가 처리하기 적합한 포맷으로 변환합니다.
+   - `clone()`: 원본 `m_cap_img`가 다른 스레드(비디오 재생 등)에서 동시에 변경될 수 있으므로, 반드시 깊은 복사를 수행하여 스레드 안전성을 확보합니다.
+   - `cvtColor`: OpenCV의 기본인 4채널(BGRA) 이미지인 경우 3채널(BGR)로 변환합니다.
+
+   #+BEGIN_SRC cpp
+   // 이미지 깊은 복사
+   cv::Mat dst_img = pDlg->m_cap_img.clone();
+
+   // 4채널(투명도 포함)인 경우 3채널로 변환
+   if (dst_img.channels() == 4)
+       cvtColor(dst_img, dst_img, COLOR_BGRA2BGR);
+   #+END_SRC
+
+
+**** 3. Python 함수 호출 및 추론 (Python Inference)
+   `pybind11`을 사용하여 C++의 `cv::Mat`을 Python 객체로 변환하고, 스레드 초기화 시점에 로드해둔 Python 함수(`func_mp_pose`)를 호출합니다.
+   - `pybind11::cast(dst_img)`: OpenCV Mat 데이터를 Python `numpy.ndarray`로 자동 변환하여 인자로 전달합니다.
+   - `func_mp_pose(...)`: Python 영역(`ACR.mp_detect` 모듈)의 MediaPipe Pose 추론을 실행하고 결과를 반환받습니다.
+
+   #+BEGIN_SRC cpp
+   // Python 함수 호출 (이미지 전달 및 추론 실행)
+   auto result_pose_mp = func_mp_pose(pybind11::cast(dst_img));
+   #+END_SRC
+
+
+**** 4. 결과 데이터 파싱 (Result Parsing)
+   Python 리턴값을 C++ 데이터 타입으로 변환하고, 결과를 저장할 멤버 변수 벡터를 초기화합니다.
+   - 반환값 구조: Python List `[[x1, x2...], [y1, y2...], [z1, z2...]]` 형태.
+   - `cast<...>`: Python 객체를 C++의 `std::vector<std::vector<double>>` 타입으로 캐스팅합니다.
+
+   #+BEGIN_SRC cpp
+   // Python 반환값을 C++ 이중 벡터로 변환
+   auto mp_result = result_pose_mp.cast<std::vector<std::vector <double>>>();
+
+   // 기존에 저장된 스켈레톤 데이터 초기화
+   pDlg->m_sgcp_vtSkeletonMP.clear();
+   #+END_SRC
+
+
+**** 5. 관절 좌표 저장 (Store Skeleton Data)
+   파싱된 좌표 데이터를 순회하며 `Point3f` 객체로 생성하여 최종 저장합니다.
+   - `mp_result[0]`: X 좌표 리스트
+   - `mp_result[1]`: Y 좌표 리스트
+   - `mp_result[2]`: Z 좌표 리스트
+   - 위 3개 리스트의 같은 인덱스(`k`)를 조합하여 하나의 3D 좌표(`Point3f`)를 만듭니다.
+
+   #+BEGIN_SRC cpp
+   // 데이터 유효성 검사 (X, Y, Z 축 데이터가 모두 있는지)
+   if (mp_result.size() >= 3)
+   {
+       // 랜드마크 개수만큼 반복
+       for (int k = 0; k < mp_result[0].size(); k++)
+       {
+           // x, y, z 좌표를 묶어 Point3f로 저장
+           pDlg->m_sgcp_vtSkeletonMP.push_back(
+               Point3f(mp_result[0][k], mp_result[1][k], mp_result[2][k])
+           );
+       }
+   }
+   #+END_SRC
+
+
+**** 6. 완료 신호 전송 (Signal Completion)
+   모든 처리가 완료되었음을 알리는 이벤트를 발생시킵니다. 이를 통해 `WaitForSingleObject(hAIFinish)`로 대기 중이던 메인 로직(전송 스레드 등)이 깨어나 다음 단계(gRPC 전송 등)를 진행하게 됩니다.
+
+   #+BEGIN_SRC cpp
+   // 처리 완료 신호 발생
+   SetEvent(pDlg->hAIFinish);
+   #+END_SRC
+** gemini-cli(함수 주석)
+`AIThread`의 실행 과정을 코드와 함께 단계별로 설명하겠습니다. `AIThread`는 `gRPCThread_.h`에 정의된 `CWinThread`를 상속받는 클래스로 보이며, 실제 로직은 `gRPCFileClient.cpp`와 `gRPCFileClientDlg.cpp`에서 호출되고 실행됩니다.
+
+```org
+#+TITLE: AIThread 영상 처리 및 gRPC 통신 과정 분석
+
+*** 1. 스레드 시작 및 초기화 (사용자 입력)
+사용자가 UI에서 "Start" 버튼을 클릭하면 `CgRPCFileClientDlg::OnBnClickedButtonStart()` 함수가 호출됩니다. 이 함수는 gRPC 채널을 설정하고, `gRPCFileClient` 객체를 초기화한 뒤, `AIProcessingThread` (실제 `AIThread` 인스턴스)를 생성하고 시작합니다.
+
+#+BEGIN_SRC cpp
+// gRPCFileClientDlg.cpp
+void CgRPCFileClientDlg::OnBnClickedButtonStart()
+{
+    // ... UI 컨트롤 비활성화 ...
+
+    // gRPC 채널 생성 및 클라이언트 초기화
+    std::string server_address("localhost:50051");
+    stub_ = KSLSentenceRecognition::NewStub(grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials()));
+    g_gRPCClient = new gRPCFileClient(stub_.get());
+    g_gRPCClient->set_dlg(this);
+
+    // AI 처리 스레드 생성 및 시작
+    // AfxBeginThread는 CWinThread를 상속받은 클래스의 인스턴스를 생성하고 스레드를 시작합니다.
+    // AIProcessingThread는 CWinThread를 상속받은 클래스일 것입니다.
+    p_th_ai_proc = (AIProcessingThread*)AfxBeginThread(
+        RUNTIME_CLASS(AIProcessingThread), // 스레드 클래스
+        THREAD_PRIORITY_NORMAL,
+        0,
+        CREATE_SUSPENDED); // 일단 정지 상태로 생성
+
+    // 스레드에 필요한 정보(gRPC 클라이언트, 파일 경로 등)를 전달
+    p_th_ai_proc->set_grpc_client(g_gRPCClient);
+    p_th_ai_proc->set_video_path(std::string(CT2CA(str_video_path)));
+    p_th_ai_proc->set_dlg(this);
+
+    // 스레드 실행 재개
+    p_th_ai_proc->ResumeThread();
+}
+#+END_SRC
+
+*** 2. 스레드 메인 루프 진입 (`AIProcessingThread::InitInstance`)
+`AfxBeginThread`에 의해 스레드가 시작되면, `CWinThread`의 가상 함수인 `InitInstance()`가 가장 먼저 호출됩니다. 이 함수는 스레드의 주된 로직을 포함하는 진입점 역할을 합니다.
+
+#+BEGIN_SRC cpp
+// gRPCThread_.h 또는 관련 구현 파일에 있을 것으로 예상되는 코드
+BOOL AIProcessingThread::InitInstance()
+{
+    // 스레드의 메인 로직 함수인 Run()을 호출합니다.
+    // 이 함수가 반환될 때까지 스레드는 살아있습니다.
+    Run();
+    return TRUE; // TRUE를 반환하여 스레드가 성공적으로 초기화되었음을 알림
+}
+#+END_SRC
+
+*** 3. 비디오 처리 및 gRPC 스트리밍 (`AIProcessingThread::Run`)
+`Run()` 함수는 스레드의 핵심 로직을 수행합니다. 비디오 파일을 열고, 프레임 단위로 읽어서 gRPC 서버로 스트리밍 전송을 시작합니다.
+
+#+BEGIN_SRC cpp
+// gRPCThread_.h 또는 관련 구현 파일에 있을 것으로 예상되는 코드
+void AIProcessingThread::Run()
+{
+    // 1. 비디오 캡처 객체 생성 및 파일 열기
+    cv::VideoCapture cap(video_path);
+    if (!cap.isOpened()) {
+        // ... 오류 처리 ...
+        return;
+    }
+
+    // 2. gRPC 스트리밍 시작
+    // gRPCFileClient의 StreamSentenceAnalyze 함수를 호출하여 서버와의 양방향 스트리밍을 시작합니다.
+    // 이 함수는 내부적으로 gRPC 컨텍스트를 만들고, 서버로 데이터를 보내고 응답을 읽는 루프를 시작합니다.
+    grpc_client->StreamSentenceAnalyze();
+
+    // ... 프레임 처리 루프 ...
+}
+#+END_SRC
+
+*** 4. 프레임 단위 데이터 전송 (`AIProcessingThread::Run` 루프 내부)
+`Run()` 함수 내의 루프에서 `cv::VideoCapture`를 통해 비디오 프레임을 하나씩 읽습니다. 각 프레임은 `HandTurnDetector`로 전처리된 후, gRPC 메시지 형식(`SentenceRequest`)으로 변환되어 서버로 전송됩니다.
+
+#+BEGIN_SRC cpp
+// gRPCThread_.h 또는 관련 구현 파일에 있을 것으로 예상되는 코드 (Run 함수 내부)
+void AIProcessingThread::Run()
+{
+    // ... (이전 단계 코드) ...
+
+    int frame_count = 0;
+    cv::Mat frame;
+    HandTurnDetector hand_turn_detector; // 손 방향 감지기 초기화
+
+    while (true)
+    {
+        // 4-1. 비디오에서 프레임 하나를 읽음
+        cap >> frame;
+        if (frame.empty()) {
+            // 프레임이 없으면 비디오의 끝. 루프 종료.
+            break;
+        }
+
+        // 4-2. 손 방향 감지 (전처리)
+        // is_hand_turn_frame은 프레임에서 손의 방향 전환이 감지되었는지 여부를 나타냅니다.
+        bool is_hand_turn_frame = hand_turn_detector.is_hand_turn_frame(frame);
+
+        // 4-3. gRPC 요청 메시지 생성
+        // 프레임 데이터와 메타데이터를 SentenceRequest 객체에 채웁니다.
+        Image frame_img;
+        frame_img.set_width(frame.cols);
+        frame_img.set_height(frame.rows);
+        frame_img.set_channel(frame.channels());
+        frame_img.set_data(frame.data, frame.total() * frame.elemSize());
+
+        SentenceRequest request;
+        request.set_allocated_frame_img(&frame_img);
+        request.set_frame_count(frame_count++);
+        request.set_is_hand_turn_frame(is_hand_turn_frame);
+
+        // 4-4. gRPC 스트림을 통해 서버로 요청 전송
+        // gRPCFileClient의 SendSentenceRequest 함수를 호출하여 서버로 메시지를 보냅니다.
+        grpc_client->SendSentenceRequest(request);
+
+        // 중요: request 객체에서 frame_img의 소유권을 다시 가져와야 메모리 누수를 방지할 수 있습니다.
+        request.release_frame_img();
+    }
+
+    // 5. 스트리밍 종료 신호 전송
+    // 비디오의 모든 프레임을 보낸 후, 스트림의 끝을 알리는 신호를 서버에 보냅니다.
+    grpc_client->WritesDone();
+}
+#+END_SRC
+
+*** 5. 서버 응답 수신 및 UI 업데이트 (`gRPCFileClient::StreamSentenceAnalyze`의 읽기 스레드)
+`gRPCFileClient::StreamSentenceAnalyze` 함수는 요청을 보내는 동시에, 별도의 읽기 스레드를 생성하여 서버로부터의 응답을 비동기적으로 기다립니다. 서버로부터 응답(`SentenceResponse`)이 오면, 이 데이터를 파싱하여 UI를 업데이트하도록 메인 다이얼로그에 메시지를 보냅니다.
+
+#+BEGIN_SRC cpp
+// gRPCFileClient.cpp
+void gRPCFileClient::StreamSentenceAnalyze()
+{
+    // ... (컨텍스트 및 스트림 객체 초기화) ...
+
+    // 읽기 스레드 생성: 서버로부터의 응답을 비동기적으로 처리
+    std::thread read_thread([this]() {
+        SentenceResponse response;
+        // stream->Read()는 서버로부터 메시지가 올 때까지 블로킹됩니다.
+        // 스트림이 닫힐 때까지 계속해서 응답을 읽습니다.
+        while (stream->Read(&response)) {
+            // 응답 처리
+            std::string sentence = response.sentence();
+            int type = response.type();
+
+            // UI 스레드로 메시지를 보내 화면을 업데이트합니다.
+            // PostMessage는 비동기적으로 메시지를 보내므로 UI 스레드의 작업을 방해하지 않습니다.
+            // 사용자 정의 메시지인 WM_UPDATE_SENTENCE를 사용합니다.
+            if (dlg) {
+                // 응답 데이터를 동적으로 할당하여 메시지와 함께 전달
+                ResponseData* pData = new ResponseData{ CString(sentence.c_str()), type };
+                dlg->PostMessage(WM_UPDATE_SENTENCE, (WPARAM)pData, 0);
+            }
+        }
+    });
+
+    // 메인 스레드(AIProcessingThread)는 이 함수 호출 후 바로 리턴되지 않고,
+    // 읽기 스레드가 종료될 때까지 기다립니다.
+    read_thread.join();
+}
+#+END_SRC
+
+*** 6. 스레드 종료
+`AIProcessingThread::Run()` 함수의 루프가 모두 끝나고 `grpc_client->WritesDone()`이 호출되면, `gRPCFileClient`의 읽기 스레드도 서버로부터 스트림 종료 신호를 받고 종료됩니다. 결과적으로 `AIProcessingThread::Run()` 함수가 반환되고, `InitInstance()`도 종료되면서 `AIThread`는 모든 작업을 마치고 소멸합니다.
+```
