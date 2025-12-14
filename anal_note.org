@@ -131,7 +131,6 @@ message SubmitResultResponse {
 * AIThread
 ** gemini-web
 `AIThread`는 메인 로직(비디오 재생 또는 gRPC 전송 스레드)으로부터 영상 데이터가 준비되었다는 신호를 받으면, 내장된 Python 인터프리터를 통해 MediaPipe 로직을 수행하고 결과를 C++ 구조체에 저장합니다.
-
 **** 1. 실행 대기 및 시작 신호 수신 (Wait for Signal)
    AI 스레드는 무한 루프 내에서 `hAIStart` 이벤트가 발생하기를 대기합니다. 이 이벤트는 메인 스레드나 비디오 스레드에서 `SetEvent(hAIStart)`를 호출할 때 활성화됩니다.
    - `WaitForSingleObject`: CPU 자원을 소모하지 않고 대기 상태로 머뭅니다.
@@ -154,7 +153,6 @@ message SubmitResultResponse {
    }
    #+END_SRC
 
-
 **** 2. 이미지 전처리 (Preprocessing)
    원본 이미지를 복제하고, Python 라이브러리(MediaPipe)가 처리하기 적합한 포맷으로 변환합니다.
    - `clone()`: 원본 `m_cap_img`가 다른 스레드(비디오 재생 등)에서 동시에 변경될 수 있으므로, 반드시 깊은 복사를 수행하여 스레드 안전성을 확보합니다.
@@ -169,7 +167,6 @@ message SubmitResultResponse {
        cvtColor(dst_img, dst_img, COLOR_BGRA2BGR);
    #+END_SRC
 
-
 **** 3. Python 함수 호출 및 추론 (Python Inference)
    `pybind11`을 사용하여 C++의 `cv::Mat`을 Python 객체로 변환하고, 스레드 초기화 시점에 로드해둔 Python 함수(`func_mp_pose`)를 호출합니다.
    - `pybind11::cast(dst_img)`: OpenCV Mat 데이터를 Python `numpy.ndarray`로 자동 변환하여 인자로 전달합니다.
@@ -179,7 +176,6 @@ message SubmitResultResponse {
    // Python 함수 호출 (이미지 전달 및 추론 실행)
    auto result_pose_mp = func_mp_pose(pybind11::cast(dst_img));
    #+END_SRC
-
 
 **** 4. 결과 데이터 파싱 (Result Parsing)
    Python 리턴값을 C++ 데이터 타입으로 변환하고, 결과를 저장할 멤버 변수 벡터를 초기화합니다.
@@ -193,7 +189,6 @@ message SubmitResultResponse {
    // 기존에 저장된 스켈레톤 데이터 초기화
    pDlg->m_sgcp_vtSkeletonMP.clear();
    #+END_SRC
-
 
 **** 5. 관절 좌표 저장 (Store Skeleton Data)
    파싱된 좌표 데이터를 순회하며 `Point3f` 객체로 생성하여 최종 저장합니다.
@@ -216,7 +211,6 @@ message SubmitResultResponse {
        }
    }
    #+END_SRC
-
 
 **** 6. 완료 신호 전송 (Signal Completion)
    모든 처리가 완료되었음을 알리는 이벤트를 발생시킵니다. 이를 통해 `WaitForSingleObject(hAIFinish)`로 대기 중이던 메인 로직(전송 스레드 등)이 깨어나 다음 단계(gRPC 전송 등)를 진행하게 됩니다.
@@ -810,3 +804,300 @@ MediaPipe는 21개 랜드마크의 '위치'를 제공할 뿐, "이것이 '주먹
    // 처리 완료 신호 발생
    SetEvent(pDlg->hAIFinish);
    #+END_SRC
+* mediapipe 판단 과정 예제
+** KeyFrame 결정 알고리즘의 상세 설명
+**주요 목적:** 사용자의 수어 동작 시퀀스에서 의미 있는 시작점, 정지 지점 또는 중요한 자세 변화를 나타내는 프레임을 'KeyFrame'으로 식별하여 gRPC 서버로 전송합니다.
+
+**1. 초기화 및 비디오 프레임 처리 루프 (Within =SequenceClient::SendFrames=):**
+   - **비디오 로드:** 사용자가 지정한 비디오 파일을 =cv::VideoCapture=로 엽니다.
+   - **프레임 루프:** 비디오의 시작 프레임부터 종료 프레임까지 순회하면서 각 프레임에 대해 다음 단계를 반복합니다.
+   - **ROI 추출:** 현재 프레임(=img=)에서 미리 정의된 ROI(=pDlg->m_roi=)를 추출하여 =roi=(=cv::Mat=) 변수에 저장합니다. 이 =roi=는 주로 손과 상체 영역을 포함하며, 이후 모든 분석에 사용됩니다.
+   - **ROI 리사이즈:** 필요한 경우 =roi=를 특정 크기(예: 320px 너비)로 리사이즈하여 =pDlg->m_cap_img=에 저장합니다. 이는 AI 처리의 입력 크기를 표준화합니다.
+
+**2. AI (MediaPipe Pose) 처리 (Delegated to =AIThread=):**
+   - **AI 스레드 트리거:** =SetEvent(pDlg->hAIStart)=를 호출하여 =AIThread=가 현재 =pDlg->m_cap_img=에 있는 프레임을 처리하도록 지시합니다.
+   - **AI 스레드 대기:** =WaitForSingleObject(pDlg->hAIFinish, INFINITE)=를 통해 =AIThread=의 작업이 완료될 때까지 대기합니다.
+   - **결과 획득:** =AIThread=는 =pybind11=을 통해 Python =ACR.mp_detect= 모듈의 =mediapipe_pose_func=를 호출하여 MediaPipe Pose 감지를 수행하고, 감지된 3D 포즈 키포인트(스켈레톤 데이터)를 =pDlg->m_sgcp_vtSkeletonMP=에 저장합니다. 이 데이터는 KeyFrame 결정의 핵심 입력 중 하나입니다.
+
+**3. KeyFrame 판단을 위한 신호 추출:**
+
+   - **손 상태 추정 (=pDlg->GetRoughHandStatusFromMP=):**
+     - =pDlg->m_sgcp_vtSkeletonMP= (MediaPipe 포즈 키포인트)를 입력으로 받아 손의 대략적인 상태를 반환합니다.
+     - 반환 값: =-1=(오류), =0=(준비 상태), =1=(오른손 사용), =2=(왼손 사용), =3=(양손 사용).
+     - =hand_status != 0=인 경우에만 KeyFrame 후보로 고려됩니다. 즉, 손이 감지되고 특정 역할을 하고 있을 때만 중요하게 봅니다.
+
+   - **움직임 상태 추정 (=pDlg->GetMotionStatusFromMP=):**
+     - 현재 움직임 상태(=cur_motion_status=)와 =pDlg->m_sgcp_vtSkeletonMP=를 입력으로 받아 새로운 움직임 상태를 반환합니다.
+     - 주로 손목 키포인트(=prev_mp[16]= (오른쪽), =prev_mp[15]= (왼쪽))의 이전 프레임 대비 현재 프레임에서의 위치 변화(=Rdev=, =Ldev=)를 기반으로 판단합니다.
+     - 변화가 =RAPID_DISTANCE= 임계값보다 크면 =RAPID_MOTION_STATUS= (빠른 움직임)를 반환합니다.
+     - =READY_MOTION_STATUS= (준비 단계)에서 =hand_status > 0=이 되면 =SPEAK_MOTION_STATUS= (수어 단계)로 전환합니다.
+     - =motion_status=는 수어 동작의 전반적인 맥락을 제공합니다.
+
+   - **옵티컬 플로우 기반 움직임 값 계산 (=pDlg->GetMotionVauleWithOpticalFlow=):**
+     - =roi= (관심 영역)를 입력으로 받아 이전 프레임과의 옵티컬 플로우(Optical Flow)를 계산하여 ROI 내의 평균 움직임 값(=avgMotion=)을 반환합니다.
+     - =cv::goodFeaturesToTrack=으로 특징점을 찾고, =cv::calcOpticalFlowPyrLK=를 사용하여 특징점의 움직임을 추적합니다.
+     - =avgMotion= 값이 낮을수록 해당 영역의 움직임이 적다는 것을 의미하며, 정지 상태를 판단하는 데 사용됩니다.
+
+   - **손 회전/방향 전환 감지 (=HandTurnDetector::update=):**
+     - =pDlg->m_Rdetector= (오른손) 및 =pDlg->m_Ldetector= (왼손) 인스턴스의 =update= 메서드를 호출합니다.
+     - =update= 메서드는 손의 위치(=pDlg->m_sgcp_vtSkeletonMP[16]= 또는 =pDlg->m_sgcp_vtSkeletonMP[15]=)와 시간 차이(=dt=)를 입력받아, 손의 **"방향 전환 + 감속"**이 동시에 발생했는지 여부를 =bool= 값으로 반환합니다 (=Rhit=, =Lhit=).
+     - =HandTurnDetector=는 다음 두 가지 조건을 모두 만족할 때 =true=를 반환합니다:
+       1.  **각도 변화:** 이전 속도 벡터와 현재 속도 벡터 간의 각도 변화가 =angleRadTh_= (기본 30도)를 초과할 때 (방향 전환).
+       2.  **속도 비율:** 현재 속도가 이전 속도에 대한 =speedRatioTh_= (기본 0.8)보다 작을 때 (감속).
+     - =Rhit= 또는 =Lhit=이 =true=이면 =RTurncnt= 또는 =Lturncnt=를 증가시키고 =speakstartflag=를 =1=로 설정합니다. 이는 수어 동작의 시작점으로 간주될 수 있는 중요한 포인트입니다.
+
+**4. KeyFrame 최종 결정 로직:**
+
+   - 위에서 추출된 모든 신호를 종합하여 KeyFrame을 최종적으로 결정합니다.
+   - **조건 1: 손 감지 (=hand_status != 0=)**
+     - 먼저 손이 감지되어야 KeyFrame 후보로 고려됩니다.
+   - **조건 2: 수어 동작 시작 신호 (=speakstartflag=)**
+     - =speakstartflag=는 =HandTurnDetector=에 의해 손의 방향 전환 및 감속이 감지되었을 때 =1=로 설정됩니다. 이는 수어 동작이 시작되었을 가능성을 나타냅니다.
+   - **조건 3: 낮은 움직임 값 (=avgMotion < OPTICALFLOW_THRESH=)**
+     - ROI 내의 평균 움직임 값(=avgMotion=)이 미리 정의된 =OPTICALFLOW_THRESH= 임계값보다 작아야 합니다. 이는 손이나 팔이 상대적으로 정지된 상태에 있음을 의미합니다.
+   - **조건 4: 중복 방지 (=frozenflag == 0=)**
+     - =frozenflag=는 이전에 KeyFrame이 전송된 경우 일정 시간 동안(=OPTICAL_FLOW_HOLD_FRAME= 프레임 동안) 추가적인 KeyFrame 전송을 방지하기 위한 플래그입니다. =frozenflag=가 =0=이어야만 KeyFrame으로 전송될 수 있습니다. KeyFrame 전송 후 =frozenflag=는 =OPTICAL_FLOW_HOLD_FRAME= 값으로 설정되고, 매 프레임마다 감소하여 =0=이 될 때까지 새로운 KeyFrame 전송을 억제합니다.
+
+   - **모든 조건 만족 시 KeyFrame으로 전송:**
+     - =if (speakstartflag && avgMotion < OPTICALFLOW_THRESH && frozenflag == 0)= 이 조건이 =true=가 되면, 현재 프레임은 KeyFrame으로 간주됩니다.
+     - =Holdcnt=를 증가시킵니다.
+     - 현재 =roi=, =session_id=, =frameIndex=, =flag= (1), =pDlg->m_sgcp_vtSkeletonMP=를 사용하여 =vision::raw::v1::Frame= 객체를 인코딩합니다 (=EncodeFrame=).
+     - 인코딩된 =Frame=을 gRPC =writer->Write(frame)=를 통해 서버로 스트리밍합니다.
+     - =frozenflag=를 =OPTICAL_FLOW_HOLD_FRAME=으로 설정하여 다음 =OPTICAL_FLOW_HOLD_FRAME= 동안 KeyFrame 중복 전송을 방지합니다.
+
+이 알고리즘은 MediaPipe를 통해 추출된 정밀한 포즈 데이터와 OpenCV의 옵티컬 플로우, 그리고 수어 동작의 특성을 고려한 커스텀 손 움직임 감지 (=HandTurnDetector=)를 결합하여, 동영상에서 의미 있는 수어 KeyFrame을 효율적으로 식별하고 전송하도록 설계되었습니다.
+`HandTurnDetector.hpp` 파일의 실제 코드를 가지고 있지 않으므로, 이 알고리즘이 이름과 문맥상 수행할 것으로 예상되는 *가설적인 실행 과정*을 구체적인 숫자를 들어 설명해 드리겠습니다. 실제 구현은 다를 수 있습니다.
+
+`HandTurnDetector`의 목표는 MediaPipe로 추출된 손의 3D 스켈레톤 데이터를 분석하여 *손의 움직임 방향 전환*이나 *속도 변화(감속)*와 같은 주요 분절점(키프레임)을 감지하는 것입니다. 이를 위해 이전 프레임의 손 상태와 현재 프레임의 손 상태를 비교합니다.
+
+---
+
+**`HandTurnDetector` 알고리즘 가설적 실행 과정 (예시)**
+
+가장 단순한 예시로, `HandTurnDetector`가 손목(`wrist`)과 검지손가락 끝(`index_tip`) 두 지점만을 사용하여 손의 '방향'을 나타내는 벡터를 만들고, 이 벡터의 **각도 변화**를 감지한다고 가정해 보겠습니다.
+
+**내부 상태 변수 (가정):**
+
+** KeyFrame 결정 알고리즘의 상세 설명2
+**주요 목적:** 사용자의 수어 동작 시퀀스에서 의미 있는 시작점, 정지 지점 또는 중요한 자세 변화를 나타내는 프레임을 'KeyFrame'으로 식별하여 gRPC 서버로 전송합니다.
+
+**1. 초기화 및 비디오 프레임 처리 루프 (Within =grpc_client_::SequenceClient::SendFrames=):**
+   - **비디오 로드:**
+     #+begin_src cpp
+     VideoCapture cap(pDlg->m_util.StringToChar(file_str));
+     #+end_src
+   - **프레임 루프:**
+     #+begin_src cpp
+     while (pDlg->m_exit.load() == false)
+     {
+         cap >> img;
+         int frameIndex = (int)cap.get(cv::CAP_PROP_POS_FRAMES);
+         if (img.empty() || frameIndex > _ttoi(strs2[1])) break;
+         // ...
+     }
+     #+end_src
+   - **ROI 추출 및 시각화:**
+     #+begin_src cpp
+     auto cap_img = img.clone();
+     rectangle(cap_img, pDlg->m_roi, Scalar(0, 255, 0), 3); // UI에 ROI 사각형 그리기
+     // ...
+     cv::Mat roi = img(pDlg->m_roi).clone(); // 실제 ROI 데이터 추출
+     #+end_src
+   - **ROI 리사이즈:**
+     #+begin_src cpp
+     if (roi.cols >= 320)
+     {
+         cv::Mat resize_roi_img;
+         double src_x = static_cast<double>(roi.cols);
+         double src_y = static_cast<double>(roi.rows);
+         double target_x = 320.0;
+         double scale = target_x / src_x;
+         double dst_x_rate = scale;
+         double dst_y_rate = scale;
+         cv::resize(roi, resize_roi_img, cv::Size(), dst_x_rate, dst_y_rate, cv::INTER_LINEAR);
+         pDlg->m_cap_img = resize_roi_img;
+     }
+     else pDlg->m_cap_img = roi;
+     #+end_src
+
+**2. AI (MediaPipe Pose) 처리 (Delegated to =CgRPCFileClientDlg::AIThread=):**
+   - **AI 스레드 트리거 및 대기 (from =SequenceClient::SendFrames=):**
+     #+begin_src cpp
+     SetEvent(pDlg->hAIStart);
+     WaitForSingleObject(pDlg->hAIFinish, INFINITE); //Wait for results
+     #+end_src
+   - **AI 스레드 내부 로직 (from =CgRPCFileClientDlg::AIThread=):**
+     #+begin_src cpp
+     pybind11::scoped_interpreter guard{};
+     try {
+         auto exampleModule4 = pybind11::module_::import("ACR.mp_detect");
+         auto func_mp_pose = exampleModule4.attr("mediapipe_pose_func");
+         // ...
+         while (pDlg->m_exit.load() == 0)
+         {
+             WaitForSingleObject(pDlg->hAIStart, INFINITE);
+             if (!pDlg->m_cap_img.empty())
+             {
+                 cv::Mat dst_img = pDlg->m_cap_img.clone();
+                 if (dst_img.channels() == 4) cvtColor(dst_img, dst_img, COLOR_BGRA2BGR);
+                 auto result_pose_mp = func_mp_pose(pybind11::cast(dst_img)); // Python MediaPipe 함수 호출
+                 auto mp_result = result_pose_mp.cast<std::vector<std::vector <double>>>();
+
+                 pDlg->m_sgcp_vtSkeletonMP.clear();
+
+                 if (mp_result.size() >= 3)
+                 {
+                     for (int k = 0; k < mp_result[0].size(); k++)
+                     {
+                         pDlg->m_sgcp_vtSkeletonMP.push_back(Point3f(mp_result[0][k], mp_result[1][k], mp_result[2][k]));
+                     }
+                 }
+             }
+             SetEvent(pDlg->hAIFinish);
+         }
+     } catch (py::error_already_set& e) {
+         std::cout << e.what() << std::endl;
+     }
+     #+end_src
+
+**3. KeyFrame 판단을 위한 신호 추출 (Within =SequenceClient::SendFrames= 및 헬퍼 함수):**
+
+   *   **손 상태 추정 (=pDlg->GetRoughHandStatusFromMP=):**
+     #+begin_src cpp
+     int hand_status = pDlg->GetRoughHandStatusFromMP(pDlg->m_sgcp_vtSkeletonMP); //손의 위치로 준비, 우세손, 비우세손, 양손 결정
+     #+end_src
+     #+begin_src cpp
+     // CgRPCFileClientDlg::GetRoughHandStatusFromMP 구현
+     int CgRPCFileClientDlg::GetRoughHandStatusFromMP(std::vector<Point3f> mp_pose)
+     {
+         int status = -1; // -1:error, 0:ready, 1:right hand, 2:left hand, 3:all hands
+         if (mp_pose.size() <= 0) return -1;
+         auto hl = GetRefHL2DPointsMP(mp_pose); // Hand Location 2D Points
+         if (hl[1].y <= READY_LOCATION && hl[0].y <= READY_LOCATION) status = 3;
+         else if (hl[1].y <= READY_LOCATION && hl[0].y > READY_LOCATION) status = 1;
+         else if (hl[1].y > READY_LOCATION && hl[0].y <= READY_LOCATION) status = 2;
+         else status = 0;
+         return status;
+     }
+     #+end_src
+
+   *   **움직임 상태 추정 (=pDlg->GetMotionStatusFromMP=):**
+     #+begin_src cpp
+     motion_status = pDlg->GetMotionStatusFromMP(motion_status, pDlg->m_sgcp_vtSkeletonMP); //준비단계인지 수어 단계인지 구분
+     #+end_src
+     #+begin_src cpp
+     // CgRPCFileClientDlg::GetMotionStatusFromMP 구현
+     int CgRPCFileClientDlg::GetMotionStatusFromMP(int cur_motion_status, std::vector<cv::Point3f> cur_mp)
+     {
+         static std::vector<cv::Point3f> prev_mp;
+         if (cur_motion_status == RESET_MOTION_STATUS) { prev_mp.clear(); return RESET_MOTION_STATUS; }
+         int motion_status = cur_motion_status;
+         if (prev_mp.size() <= 0) { prev_mp = cur_mp; return READY_MOTION_STATUS; }
+         auto Rdev = m_util.Distance(cv::Point2f(prev_mp[16].x - cur_mp[16].x, prev_mp[16].y - cur_mp[16].y));
+         auto Ldev = m_util.Distance(cv::Point2f(prev_mp[15].x - cur_mp[15].x, prev_mp[15].y - cur_mp[15].y));
+         // ...
+         if (Rdev > RAPID_DISTANCE || Ldev > RAPID_DISTANCE) return RAPID_MOTION_STATUS;
+         if (cur_motion_status == READY_MOTION_STATUS) {
+             int hand_status = GetRoughHandStatusFromMP(cur_mp);
+             if (hand_status > 0) motion_status = SPEAK_MOTION_STATUS;
+         } else if (cur_motion_status == SPEAK_MOTION_STATUS) {
+             if (prev_mp.size() > 0 && cur_mp.size() > 0) {
+                 motion_status = READY_MOTION_STATUS; // 이 부분은 로직에 따라 변경될 수 있음
+             }
+         }
+         prev_mp = cur_mp;
+         return motion_status;
+     }
+     #+end_src
+
+   *   **옵티컬 플로우 기반 움직임 값 계산 (=pDlg->GetMotionVauleWithOpticalFlow=):**
+     #+begin_src cpp
+     double avgMotion = pDlg->GetMotionVauleWithOpticalFlow(roi);
+     #+end_src
+     #+begin_src cpp
+     // CgRPCFileClientDlg::GetMotionVauleWithOpticalFlow(cv::Mat frame) 구현
+     double CgRPCFileClientDlg::GetMotionVauleWithOpticalFlow(cv::Mat frame)
+     {
+         static cv::Mat prev;
+         // ...
+         if (!prev.empty()) avgMotion = GetMotionVauleWithOpticalFlow(prev, frame, rect); // 다른 오버로드 호출
+         prev = frame.clone();
+         return avgMotion;
+     }
+
+     // CgRPCFileClientDlg::GetMotionVauleWithOpticalFlow(cv::Mat prev, cv::Mat frame, cv::Rect rect) 구현
+     double CgRPCFileClientDlg::GetMotionVauleWithOpticalFlow(cv::Mat prev, cv::Mat frame, cv::Rect rect)
+     {
+         cv::Mat prevGray, gray;
+         cv::cvtColor(prev, prevGray, cv::COLOR_BGR2GRAY);
+         cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+         // ...
+         std::vector<cv::Point2f> prevPts;
+         cv::goodFeaturesToTrack(prevGray, prevPts, 300, 0.01, 7); // 특징점 추출
+         // ...
+         cv::calcOpticalFlowPyrLK(prevGray, gray, prevPts, nextPts, status, err); // 옵티컬 플로우 계산
+         // ... (움직임 벡터 길이 합산 및 평균 계산)
+         return avgMotion;
+     }
+     #+end_src
+
+   *   **손 회전/방향 전환 감지 (=HandTurnDetector::update=):**
+     #+begin_src cpp
+     bool Rhit = pDlg->m_Rdetector.update({ pDlg->m_sgcp_vtSkeletonMP[16].x, pDlg->m_sgcp_vtSkeletonMP[16].y }, dt);
+     bool Lhit = pDlg->m_Ldetector.update({ pDlg->m_sgcp_vtSkeletonMP[15].x, pDlg->m_sgcp_vtSkeletonMP[15].y }, dt);
+     #+end_src
+     #+begin_src cpp
+     // HandTurnDetector::update 구현 (HandTurnDetector.hpp)
+     bool HandTurnDetector::update(const cv::Point2f& pos, double dt)
+     {
+         bool detected = false;
+         if (!hasPrevPos_) { /* ... */ } // 초기화 로직
+         cv::Point2f vel;
+         // ... (속도 계산) ...
+         if (hasPrevVel_) {
+             float prevSpeed = std::sqrt(prevVel_.x * prevVel_.x + prevVel_.y * prevVel_.y);
+             if (prevSpeed > minSpeed_)
+             {
+                 cv::Point2f u1 = prevVel_ * (1.0f / prevSpeed);
+                 cv::Point2f u2 = vel * (1.0f / (speed + 1e-6f));
+                 float dot = u1.x * u2.x + u1.y * u2.y;
+                 float dtheta = std::acos(dot); // 각도 변화 (라디안)
+                 float ratio = speed / (prevSpeed + 1e-6f); // 속도 비율
+                 if (dtheta > angleRadTh_ && ratio < speedRatioTh_) { // 방향 전환 + 감속 조건
+                     detected = true;
+                 }
+             }
+         }
+         // ... (다음 프레임을 위한 상태 저장) ...
+         return detected;
+     }
+     #+end_src
+     #+begin_src cpp
+     // Rhit 또는 Lhit이 true이면
+     if (Rhit) { RTurncnt++; speakstartflag = 1; }
+     else if (Lhit) { Lturncnt++; speakstartflag = 1; }
+     #+end_src
+
+**4. KeyFrame 최종 결정 로직 (Within =SequenceClient::SendFrames=):**
+
+   *   **복합 조건 확인:**
+     #+begin_src cpp
+     if (hand_status != 0) // 조건 1: 손 감지
+     {
+         // ... (avgMotion, Rhit, Lhit 계산) ...
+
+         if (speakstartflag && avgMotion < OPTICALFLOW_THRESH && frozenflag == 0) // 조건 2,3,4
+         {
+             Holdcnt++;
+
+             Frame frame;
+             EncodeFrame(roi, session_id, frameIndex, 1, pDlg->m_sgcp_vtSkeletonMP,&frame); // KeyFrame 인코딩
+             writer->Write(frame); // gRPC 서버로 전송
+
+             frozenflag = OPTICAL_FLOW_HOLD_FRAME; // 중복 방지 플래그 설정
+         }
+     }
+     if (frozenflag > 0) frozenflag--; // frozenflag 감소
+     #+end_src
+
+이 알고리즘은 MediaPipe를 통해 추출된 정밀한 포즈 데이터와 OpenCV의 옵티컬 플로우, 그리고 수어 동작의 특성을 고려한 커스텀 손 움직임 감지 (=HandTurnDetector=)를 결합하여, 동영상에서 의미 있는 수어 KeyFrame을 효율적으로 식별하고 전송하도록 설계되었습니다.
