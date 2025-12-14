@@ -1,0 +1,66 @@
+* proto structure
+#+begin_src proto
+syntax = "proto3";
+package vision.raw.v1;
+
+service SequenceService {
+  rpc SendFrames (stream Frame) returns (SubmitResultResponse);
+}
+
+message Point3 {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}
+
+message Frame {
+  string session_id = 1;
+  int32 index = 2;
+  int32 flag = 3; // 0: START, 1: NORMAL, 2: END
+  int32 width = 4;
+  int32 height = 5;
+  int32 type = 6;
+  bytes data = 7;
+  repeated Point3 pose_points = 8;
+}
+
+message SubmitResultResponse {
+  string session_id = 1;
+  int32 frame_count = 2;
+  string message = 3;
+}
+ session_id(string): 세션 식별자
+  - index(int32): 프레임 번호
+  - flag(int32): 상태 플래그(0=START, 1=NORMAL, 2=END)
+  - width/height/type(int32): 프레임 크기와 OpenCV 타입 값
+  - data(bytes): 프레임 이미지 바이너리
+  - pose_points(repeated Point3): 포즈 좌표 목록(x,y,z float)
+
+#+end_src
+#+begin_src markdown
+**`ksl_sentence_recognition.proto` 파일에 정의된 데이터 구조 및 역할:**
+
+1.  **`Point3` 메시지**
+    *   **구조**: `float x`, `float y`, `float z` 세 개의 부동 소수점 필드를 가집니다.
+    *   **역할**: 3차원 공간에서의 한 지점(예: MediaPipe로 추출된 스켈레톤 관절의 3D 좌표)을 표현하는 데 사용됩니다.
+
+2.  **`Frame` 메시지**
+    *   **구조**:
+        *   `string session_id`: 현재 비디오 처리 세션을 식별하는 문자열 ID.
+        *   `int32 index`: 비디오 시퀀스 내에서 현재 프레임의 순서 번호.
+        *   `int32 flag`: 프레임의 특정 상태나 목적을 나타내는 정수 플래그 (예: 0=시작, 1=일반, 2=종료).
+        *   `int32 width`: 프레임 이미지의 가로 픽셀 수.
+        *   `int32 height`: 프레임 이미지의 세로 픽셀 수.
+        *   `int32 type`: OpenCV `cv::Mat` 객체의 데이터 타입 (예: `CV_8UC3`은 8비트 unsigned char 3채널 이미지를 의미).
+        *   `bytes data`: 실제 프레임 이미지의 바이너리 데이터 (압축되지 않은 픽셀 데이터).
+        *   `repeated Point3 pose_points`: 이 프레임에서 감지된 여러 `Point3` 객체들의 목록. 주로 MediaPipe와 같은 AI 모델이 추출한 인체 관절의 3D 좌표를 담습니다.
+    *   **역할**: 클라이언트가 gRPC 서버로 전송하는 단일 비디오 프레임에 대한 모든 관련 정보를 캡슐화합니다. 이미지 데이터 자체와 함께, 해당 프레임의 메타데이터(세션 ID, 인덱스, 플래그, 크기, 타입) 및 AI 분석 결과(포즈 포인트)를 포함하여 서버가 수어 인식을 수행하는 데 필요한 모든 컨텍스트를 제공합니다.
+
+3.  **`SubmitResultResponse` 메시지**
+    *   **구조**:
+        *   `string session_id`: 요청 시 클라이언트가 보낸 세션 ID와 동일한 ID.
+        *   `int32 frame_count`: 서버가 처리한 총 프레임 수.
+        *   `string message`: 서버가 인식한 최종 수어 문장 텍스트 결과.
+    *   **역할**: gRPC 서버가 클라이언트에게 수어 인식 처리 결과를 반환할 때 사용하는 메시지입니다. 어떤 세션에 대한 응답인지, 몇 개의 프레임이 처리되었는지, 그리고 가장 중요한 인식된 수어 문장이 무엇인지를 클라이언트에게 전달합니다.
+
+#+end_src
