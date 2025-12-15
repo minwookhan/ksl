@@ -1,0 +1,284 @@
+* 시스템 이해
+#+begin_src markdown
+> 이 프로젝트의 전체 구조와 데이터 흐름을 '시스템 아키텍처' 관점에서 완벽하게 분석해줘
+  특히 비디오 프레임이 입력되어 서버로 전송되기까지의 과정을 중심으로, 아래 4가지 항목에 맞춰 정리해줘
+                                                                                                                              █
+  ### 1. 전체 시스템 & 스레드 아키텍처 (Mermaid Diagram)                                                                      █
+  - Main UI Thread, Video Thread, AI Thread, gRPC Thread 간의 상호작용을 Mermaid 시퀀스 다이어그램(Sequence Diagram)으로      █
+  그려줘.                                                                                                                     █
+  - 각 스레드 간의 동기화 방법(Event: hAIStart, hAIFinish 등)이 다이어그램에 명시되어야 해.                                   █
+                                                                                                                              █
+  ### 2. 데이터 라이프사이클 (Data Lifecycle Flow)                                                                            █
+  - 비디오 프레임 하나가 생성되어 소멸(전송)될 때까지의 단계를 5단계로 나누어 설명해줘.                                       █
+  - 각 단계에서 데이터가 어떤 변수에 담기고, 어떻게 변환되는지 추적해줘.                                                      █
+  - 예: `cv::Mat` (Raw) -> `numpy.array` (Python Input) -> `vector<double>` (Python Output) -> `vector<Point3f>` (C++ Logic)  █
+  -> `Protobuf Frame` (Network)                                                                                               █
+                                                                                                                              █
+  ### 3. 핵심 함수 I/O 분석표 (Table)                                                                                         █
+  - 주요 함수들의 입력(Input)과 출력(Output) 데이터 타입, 그리고 역할을 표로 정리해줘.                                        █
+  - 포함해야 할 함수:                                                                                                         █
+    1. `AIThread` (gRPCFileClientDlg.cpp)                                                                                     █
+    2. `SendFrames` (gRPCThread_.h)                                                                                           █
+    3. `GetMotionStatusFromMP` (gRPCThread_.h)                                                                                █
+    4. `EncodeFrame` (gRPCThread_.h)                                                                                          █
+    5. `DrawImageBMP` (VideoUtil)                                                                                             █
+                                                                                                                              █
+  ### 4. C++ <-> Python 데이터 변환 상세                                                                                      █
+  - `pybind11`을 통해 C++의 `cv::Mat`이 Python 함수로 들어갔다가, 어떤 형태의 결과값으로 다시 C++로 돌아오는지 코드 레벨에서  █
+  데이터 타입 위주로 분석해줘.                                                                                                █
+                                                                                                                              █
+  **추가 요구사항:**                                                                                                          █
+                                                                                                                              █
+  *   **코드베이스 탐색:** `codebase_investigator`를 사용하여 관련 소스 파일(`*.cpp`, `*.h`, `*.py`)을 식별하고, 함수 시그니처█
+  및 데이터 구조를 파악합니다.                                                                                                █
+  *   **Mermaid 생성:** 분석 결과를 바탕으로 Mermaid 시퀀스 다이어그램 코드를 생성합니다.                                     █
+  *   **데이터 흐름 추적:** 각 데이터 변환 단계별 변수명 및 데이터 타입을 명확히 명시합니다.                                  █
+  *   **함수 I/O 표:** `read_file`을 사용하여 각 함수의 실제 시그니처를 확인하고, 표 형식으로 정리합니다.                     █
+  *   **pybind11 분석:** `pybind11` 바인딩 코드를 집중적으로 분석하여 C++-Python 간 데이터 타입 매핑을 상세히 기술합니다.     █
+  *   **테스트:** 각 분석 항목에 대한 검증 방안을 제시합니다. (예: 특정 함수 호출 시 예상되는 출력 값 검증)                   █
+
+
+#+end_src
+
+#+begin_src markdown
+
+이 프로젝트의 전체 구조와 데이터 흐름을 '시스템 아키텍처' 관점에서 완벽하게 분석해줘
+  특히 비디오 프레임이 입력되어 서버로 전송되기까지의 과정을 중심으로, 아래 4가지 항목에 맞춰 정리해줘.
+
+  ### 1. 전체 시스템 & 스레드 아키텍처 (Mermaid Diagram)
+  - Main UI Thread, Video Thread, AI Thread, gRPC Thread 간의 상호작용을 Mermaid 시퀀스 다이어그램(Sequence Diagram)으로
+  그려줘.
+  - 각 스레드 간의 동기화 방법(Event: hAIStart, hAIFinish 등)이 다이어그램에 명시되어야 해.
+
+  ### 2. 데이터 라이프사이클 (Data Lifecycle Flow)
+  - 비디오 프레임 하나가 생성되어 소멸(전송)될 때까지의 단계를 5단계로 나누어 설명해줘.
+  - 각 단계에서 데이터가 어떤 변수에 담기고, 어떻게 변환되는지 추적해줘.
+  - 예: `cv::Mat` (Raw) -> `numpy.array` (Python Input) -> `vector<double>` (Python Output) -> `vector<Point3f>` (C++ Logic)
+  -> `Protobuf Frame` (Network)
+
+  ### 3. 핵심 함수 I/O 분석표 (Table)
+  - 주요 함수들의 입력(Input)과 출력(Output) 데이터 타입, 그리고 역할을 표로 정리해줘.
+  - 포함해야 할 함수:
+    1. `AIThread` (gRPCFileClientDlg.cpp)
+    2. `SendFrames` (gRPCThread_.h)
+    3. `GetMotionStatusFromMP` (gRPCThread_.h)
+    4. `EncodeFrame` (gRPCThread_.h)
+    5. `DrawImageBMP` (VideoUtil)
+
+  ### 4. C++ <-> Python 데이터 변환 상세
+  - `pybind11`을 통해 C++의 `cv::Mat`이 Python 함수로 들어갔다가, 어떤 형태의 결과값으로 다시 C++로 돌아오는지 코드 레벨에서
+  데이터 타입 위주로 분석해줘.
+
+  **추가 요구사항:**
+
+  *   **코드베이스 탐색:** `codebase_investigator`를 사용하여 관련 소스 파일(`*.cpp`, `*.h`, `*.py`)을 식별하고, 함수 시그니처
+  및 데이터 구조를 파악합니다.
+  *   **Mermaid 생성:** 분석 결과를 바탕으로 Mermaid 시퀀스 다이어그램 코드를 생성합니다.
+  *   **데이터 흐름 추적:** 각 데이터 변환 단계별 변수명 및 데이터 타입을 명확히 명시합니다.
+  *   **함수 I/O 표:** `read_file`을 사용하여 각 함수의 실제 시그니처를 확인하고, 표 형식으로 정리합니다.
+  *   **pybind11 분석:** `pybind11` 바인딩 코드를 집중적으로 분석하여 C++-Python 간 데이터 타입 매핑을 상세히 기술합니다
+  *   **테스트:** 각 분석 항목에 대한 검증 방안을 제시합니다. (예: 특정 함수 호출 시 예상되는 출력 값 검증)
+
+#+end_src
+* python porting
+0. rough prompt
+ #+begin_src markdown
+
+## Instruction
+- mfc  projet 를 python 으로 포팅한다
+- 전체 실행단계를 제시한다.
+- 전체 실행과정을 단계 별로 나누고 각 단계가 완성된 것을 확인하고 진행한다.
+- 각 단계의 입출력 조건을 명확히 한다.
+- 추가 설치해야 하는  Package 목록과 설치방법을 정리한다.
+## Python style
+- python cli 버전으로 포팅한다
+  ex) python myProgram.py movieTitle.mp4 roi_x, roi_y  --> returns proto buffer packet
+- 각 실행 단계를 명확하게 구분하여 함수형으로 작성한다.
+- test driven 으로 함수 마다 명확한 테스트를 하면서 다음 단계로 진행한다.
+#+end_src
+
+1. prompt
+#+begin_src markdown
+
+## Prompt
+
+너는 시니어 Python 소프트웨어 아키텍트이자 리버스 엔지니어.
+목표. 기존 MFC(C++/Windows) 프로젝트의 “핵심 로직”을 Python CLI 프로그램으로 포팅.
+제약. UI(MFC View/Dialog), 메시지 루프, 리소스(.rc) 관련 코드 제외. 핵심 처리 파이프라인만 포팅.
+출력은 단계별 산출물 중심. 단계 완료 검증 전 다음 단계 진행 금지.
+
+### 1) 입력으로 주어질 자료
+
+-  MFC 프로젝트 파일 트리(폴더/파일 목록)
+-  핵심 소스 파일 내용(또는 발췌)
+-  데이터 흐름 설명(있으면)
+-  protobuf `.proto` 파일(있으면)
+-  샘플 입력(예: mp4)과 기대 출력(예: 패킷/로그/결과 값)
+
+### 2) 최종 목표 CLI 스펙
+
+-  실행 예시
+  `python myProgram.py movieTitle.mp4 "roi_x,roi_y,roi_w,roi_h" --out packets.bin`
+-  입력
+
+  -  mp4 경로(필수)
+  -  ROI(필수. 문자열 또는 4정수)
+  -  옵션: 프레임 범위, FPS 샘플링, 출력 파일, 로그 레벨
+-  출력
+
+  -  protobuf packet bytes 스트림 또는 `.bin` 파일
+  -  에러 시 명확한 종료 코드 + 메시지
+
+### 3) 반드시 제시할 것
+
+A. 전체 실행 단계(End-to-End 파이프라인) 목록
+B. 각 단계별 I/O 계약
+
+-  입력 타입, 출력 타입
+-  에러 조건, 예외 타입
+-  경계 조건(빈 입력, ROI 범위 초과, 비디오 로딩 실패 등)
+
+C. 각 단계별 “완료 조건 체크리스트”
+
+-  체크리스트 충족 전 다음 단계 진행 금지
+-  체크리스트에는 테스트 통과, CLI 동작, 샘플 결과 검증 포함
+
+D. 추가 설치 패키지 목록 + 설치 방법
+
+-  venv 기준 설치 명령
+-  OS 의존 사항(Windows/Linux 차이) 있으면 명시
+
+### 4) 구현 스타일 강제
+
+-  Python CLI 중심. `src/` 모듈 + `myProgram.py` 엔트리포인트
+-  함수형 설계. 단계별 함수 분리. 사이드이펙트 최소화
+-  데이터 구조는 `dataclass` 사용
+-  로깅은 `logging` 사용
+-  외부 호출(gRPC 등) 있으면 인터페이스 레이어로 격리
+
+### 5) TDD 강제 규칙
+
+-  단계마다 “함수 목록 + 시그니처” 먼저 제시
+-  각 함수마다 pytest 단위테스트 최소 1개
+-  테스트는 성공 케이스 + 실패/경계 케이스 포함
+-  통합 단계에서는 end-to-end 테스트 추가
+-  테스트가 먼저. 구현은 테스트 다음
+
+### 6) 출력 포맷(반드시 준수)
+
+아래 템플릿을 Step 0부터 Step N까지 반복.
+
+#### Step k: <단계명>
+
+1. 목표
+2. 범위(포함/제외)
+3. I/O 계약
+4. 필요한 패키지(추가분만) + 설치 명령
+5. 함수 설계(시그니처 목록)
+6. 테스트 설계(pytest 케이스 목록)
+7. 코드 스켈레톤(파일 경로 + 최소 구현)
+8. 실행 예시(CLI)
+9. 완료 조건 체크리스트
+10. 다음 단계 입력으로 넘길 산출물
+
+### 7) 시작 지시
+
+지금 Step 0부터 작성.
+Step 0에서는 “포팅 스펙 문서”부터 작성.
+내가 “Step 0 완료”라고 말하기 전까지 Step 1 진행 금지.
+
+---
+
+
+#+end_src
+2. prompt gemini
+   #+begin_src markdown
+
+# Role
+당신은 레거시 C++(MFC) 애플리케이션을 현대적인 - *Python CLI 기반 마이크로서비스**로 리팩토링하는 수석 엔지니어입니다.
+현재 MFC로 작성된 '비디오 분석 및 gRPC 전송 클라이언트'를 Python으로 포팅해야 합니다.
+
+# Goal
+- - *UI 제거**: MFC(UI) 의존성을 제거하고, 순수 **CLI(Command Line Interface)** 도구로 전환한다.
+- - *구조 개선**: 객체지향의 복잡한 상속보다는 명확한 **함수형 프로그래밍(Functional)** 스타일을 지향한다.
+- - *안정성 확보**: 모든 기능 단위에 대해 **Test Driven Development (TDD)** 원칙을 적용한다.
+# Running Example
+ 1. 실행 예시
+  `python myProgram.py movieTitle.mp4 "roi_x,roi_y,roi_w,roi_h" --out packets.bin`
+ 2. 입력
+
+   ,-  mp4 경로(필수)
+   ,-  ROI(필수. 문자열 또는 4정수)
+   ,-  옵션: 프레임 범위, FPS 샘플링, 출력 파일, 로그 레벨
+ 3. 출력
+
+   ,-  protobuf packet bytes 스트림 또는 `.bin` 파일
+   ,-  에러 시 명확한 종료 코드 + 메시지
+ 4. 반드시 제시할 것
+   - 전체 실행 단계(End-to-End 파이프라인) 목록
+   - 각 단계별 I/O 계약
+ 5. 입력 타입, 출력 타입
+ 6. 에러 조건, 예외 타입
+ 7. 경계 조건(빈 입력, ROI 범위 초과, 비디오 로딩 실패 등)
+# 각 단계별 “완료 조건 체크리스트”
+ 1.  체크리스트 충족 전 다음 단계 진행 금지
+ 2. 체크리스트에는 테스트 통과, CLI 동작, 샘플 결과 검증 포함
+# code style
+## general style
+ 1. Python CLI 중심. `src/` 모듈 + `myProgram.py` 엔트리포인트
+ 2. 함수형 설계. 단계별 함수 분리. 사이드이펙트 최소화
+ 3. 데이터 구조는 `dataclass` 사용
+ 4. 로깅은 `logging` 사용
+  
+1. - *Style**: Pythonic한 코드 작성 (Type Hinting 필수 사용).
+2. - *Testing**: `pytest`를 사용하며, 각 단계마다 `src/모듈명.py`와 `tests/test_모듈명.py`를 쌍으로 제공할 것.
+3. - *I/O Definition**: 각 함수 상단에 Docstring으로 Input/Output 타입을 명확히 기재할 것.
+## Strong Style
+1. 단계마다 “함수 목록 + 시그니처” 먼저 제시
+2. 각 함수마다 pytest 단위테스트 최소 1개
+3. 테스트는 성공 케이스 + 실패/경계 케이스 포함
+4. 통합 단계에서는 end-to-end 테스트 추가
+5. 테스트가 먼저. 구현은 테스트 다음
+
+-  외부 호출(gRPC 등) 있으면 인터페이스 레이어로 격리
+
+# Work Process (Strict Step-by-Step)
+한 번에 모든 코드를 작성하지 마십시오. 아래 정의된 **Phase** 순서대로 하나씩 진행하며, 내가 각 단계의 코드와 테스트 결과를 승인(Confirm)해야만 다음 단계로 넘어갑니다.
+
+## [Phase 0] 프로젝트 셋업 (Environment Setup)
+- 프로젝트 디렉토리 구조 설계 (`src/`, `tests/`, `protos/` 등).
+- 필요한 패키지 (`requirements.txt`) 및 설치 명령어 작성.
+- 설정 관리 (`config` or CLI args) 구조 정의.
+
+## [Phase 1] 입력 및 전처리 (Input & Preprocessing)
+- **기능**: 비디오 스트림/파일 로드, ROI Parsing, Crop, Resize, Color Conversion.
+- **Input**: Video Path (str), ROI String ("x,y,w,h").
+- **Output**: Preprocessed Numpy Array.
+- **Test**: Mock 비디오 객체를 사용하여 전처리 로직(크기, 채널 변환) 검증.
+
+## [Phase 2] AI 추론 엔진 (AI Inference Engine)
+- **기능**: MediaPipe Pose/Hand 모델 로드 및 추론, 데이터 파싱.
+- **Input**: Preprocessed Image (Numpy Array).
+- **Output**: Skeleton Coordinates (List/Dict).
+- **Test**: 고정된 더미 이미지를 주입하여 좌표 반환 형식 검증.
+
+## [Phase 3] 비즈니스 로직 및 상태 관리 (Logic & State)
+- **기능**: 손 위치 판단(Ready/Speak), Optical Flow 계산, 상태 머신 업데이트.
+- **Input**: Current Skeleton, Previous Frame/Skeleton.
+- **Output**: Motion Status (Enum/Int).
+- **Test**: 좌표 변화 시나리오를 주입하여 상태 전이 로직 검증.
+
+## [Phase 4] gRPC 네트워크 (Network Layer)
+- **기능**: Protobuf 메시지 직렬화, gRPC 채널 연결 및 스트리밍 전송.
+- **Input**: Image, Skeleton, Status.
+- **Output**: gRPC Response / Packet Bytes.
+- **Test**: `unittest.mock`을 사용하여 gRPC 서버 없이 패킷 생성 및 호출 검증.
+
+## [Phase 5] CLI 통합 (Integration)
+- **기능**: `argparse`를 이용한 메인 진입점(`main.py`) 구현.
+- **Usage**: `python app.py <video_path> --roi x,y,w,h --server ip:port`
+- **Output**: 전송 로그 및 결과 출력.
+
+
+**[Phase 0]부터 시작해 주세요.**
+    #+end_src

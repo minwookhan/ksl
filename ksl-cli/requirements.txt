@@ -1,0 +1,15 @@
+# Core
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+numpy>=1.24.0
+protobuf>=4.24.0
+grpcio>=1.58.0
+
+# Tools
+grpcio-tools>=1.58.0  # .proto 컴파일용
+
+# Testing & Dev
+pytest>=7.4.0
+pytest-mock>=3.11.1
+black>=23.9.0         # Code formatter
+mypy>=1.5.0           # Static type checker
