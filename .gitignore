@@ -8,3 +8,4 @@ tmp/
 build
 htmlcov
 *.mp4
+*.task
