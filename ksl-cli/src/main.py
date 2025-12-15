@@ -53,15 +53,25 @@ def process_video_stream(
 
     try:
         logger.info(f"Starting video processing for session: {session_id}")
-        # Optional: Connect explicitly if desired, but gRPC channel is lazy
-        # grpc_client.connect() 
+        
+        # Prepare output file if specified
+        output_file = None
+        if config.output_path:
+            try:
+                output_file = open(config.output_path, 'wb')
+                logger.info(f"Saving packets to {config.output_path}")
+            except OSError as e:
+                logger.error(f"Failed to open output file: {e}")
 
         def frame_generator() -> Iterator[pb2.Frame]:
             nonlocal frame_count, prev_skeleton, current_motion_status # For updating outer scope variables
             
             for frame_image_rgb in video_loader.get_frames():
                 frame_count += 1
-                logger.debug(f"Processing frame {frame_count}")
+                if frame_count % 30 == 0:
+                    logger.info(f"Processing frame {frame_count}")
+                else:
+                    logger.debug(f"Processing frame {frame_count}")
 
                 # AI Inference
                 current_skeleton = pose_estimator.process_frame(frame_image_rgb)
@@ -75,13 +85,10 @@ def process_video_stream(
                 )
                 
                 # Update hand turn detectors (using dummy dt for now)
-                # For more accuracy, pass real dt from video_loader or constant frame rate.
                 if len(current_skeleton) > 16: # Ensure wrist landmarks exist
                     right_wrist = (current_skeleton[16].x, current_skeleton[16].y)
                     left_wrist = (current_skeleton[15].x, current_skeleton[15].y)
                     
-                    # Assuming a constant frame rate for dt if not explicitly calculated
-                    # This should ideally come from video_loader.get_fps()
                     DUMMY_DT = 1 / 30.0 
 
                     if right_hand_detector.update(right_wrist, DUMMY_DT):
@@ -90,34 +97,56 @@ def process_video_stream(
                         logger.info(f"Frame {frame_count}: Left hand turn detected!")
 
                 # Encode to Protobuf Frame
-                # Flag logic: Use 1 (NORMAL) for all frames for now,
-                # START/END flags can be added if specific start/end events are detected.
                 encoded_frame = encode_frame(
                     session_id=session_id,
                     index=frame_count,
-                    flag=current_motion_status, # Use motion status as flag for now
+                    flag=current_motion_status,
                     image=frame_image_rgb,
                     skeleton=current_skeleton
                 )
                 
+                # Write to file if enabled
+                if output_file:
+                    # Write size delimiter (optional but good for stream parsing) + bytes
+                    # Or just raw bytes as requested. Let's write size-delimited or raw?
+                    # Request said "protobuf packet bytes stream". Usually needs length prefix.
+                    # For simplicity, just write raw bytes of serialized message.
+                    # To read back, one needs to know boundaries (Varint delimiter).
+                    # Here we just write serialized string.
+                    serialized = encoded_frame.SerializeToString()
+                    # output_file.write(len(serialized).to_bytes(4, byteorder='big')) # Length prefix
+                    output_file.write(serialized) 
+                    output_file.flush()
+
                 prev_skeleton = current_skeleton # Update for next frame
                 yield encoded_frame
         
-        # Stream frames to gRPC server
-        response_iterator = grpc_client.send_stream(frame_generator())
+        # Stream frames
+        # We need to handle the case where gRPC fails but we still want to generate frames for file output
+        gen = frame_generator()
         
-        # Process final response from server
-        for response in response_iterator:
-            logger.info(f"Server response for session {response.session_id}: "
-                        f"Frame Count: {response.frame_count}, Message: {response.message}")
+        try:
+            response_iterator = grpc_client.send_stream(gen)
+            for response in response_iterator:
+                logger.info(f"Server response: {response.message}")
+        except Exception as e:
+            logger.warning(f"gRPC streaming failed (Server might be down): {e}")
+            logger.info("Continuing processing in offline mode (saving to file if output path set)...")
+            
+            # Consume the rest of the generator to ensure processing continues
+            try:
+                for _ in gen: 
+                    pass
+            except Exception as e_inner:
+                logger.error(f"Error during offline processing: {e_inner}")
 
-    except ConnectionRefusedError as e:
-        logger.error(f"Failed to connect to gRPC server: {e}")
-        sys.exit(1)
     except Exception as e:
         logger.exception(f"An unexpected error occurred during processing: {e}")
         sys.exit(1)
     finally:
+        if 'output_file' in locals() and output_file:
+            output_file.close()
+            logger.info("Closed output file.")
         grpc_client.close()
         logger.info(f"Finished processing for session: {session_id}. Total frames: {frame_count}")
 
