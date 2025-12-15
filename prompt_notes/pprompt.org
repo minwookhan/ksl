@@ -1,0 +1,82 @@
+* 시스템 이해
+#+begin_src markdown
+> 이 프로젝트의 전체 구조와 데이터 흐름을 '시스템 아키텍처' 관점에서 완벽하게 분석해줘
+  특히 비디오 프레임이 입력되어 서버로 전송되기까지의 과정을 중심으로, 아래 4가지 항목에 맞춰 정리해줘
+                                                                                                                              █
+  ### 1. 전체 시스템 & 스레드 아키텍처 (Mermaid Diagram)                                                                      █
+  - Main UI Thread, Video Thread, AI Thread, gRPC Thread 간의 상호작용을 Mermaid 시퀀스 다이어그램(Sequence Diagram)으로      █
+  그려줘.                                                                                                                     █
+  - 각 스레드 간의 동기화 방법(Event: hAIStart, hAIFinish 등)이 다이어그램에 명시되어야 해.                                   █
+                                                                                                                              █
+  ### 2. 데이터 라이프사이클 (Data Lifecycle Flow)                                                                            █
+  - 비디오 프레임 하나가 생성되어 소멸(전송)될 때까지의 단계를 5단계로 나누어 설명해줘.                                       █
+  - 각 단계에서 데이터가 어떤 변수에 담기고, 어떻게 변환되는지 추적해줘.                                                      █
+  - 예: `cv::Mat` (Raw) -> `numpy.array` (Python Input) -> `vector<double>` (Python Output) -> `vector<Point3f>` (C++ Logic)  █
+  -> `Protobuf Frame` (Network)                                                                                               █
+                                                                                                                              █
+  ### 3. 핵심 함수 I/O 분석표 (Table)                                                                                         █
+  - 주요 함수들의 입력(Input)과 출력(Output) 데이터 타입, 그리고 역할을 표로 정리해줘.                                        █
+  - 포함해야 할 함수:                                                                                                         █
+    1. `AIThread` (gRPCFileClientDlg.cpp)                                                                                     █
+    2. `SendFrames` (gRPCThread_.h)                                                                                           █
+    3. `GetMotionStatusFromMP` (gRPCThread_.h)                                                                                █
+    4. `EncodeFrame` (gRPCThread_.h)                                                                                          █
+    5. `DrawImageBMP` (VideoUtil)                                                                                             █
+                                                                                                                              █
+  ### 4. C++ <-> Python 데이터 변환 상세                                                                                      █
+  - `pybind11`을 통해 C++의 `cv::Mat`이 Python 함수로 들어갔다가, 어떤 형태의 결과값으로 다시 C++로 돌아오는지 코드 레벨에서  █
+  데이터 타입 위주로 분석해줘.                                                                                                █
+                                                                                                                              █
+  **추가 요구사항:**                                                                                                          █
+                                                                                                                              █
+  *   **코드베이스 탐색:** `codebase_investigator`를 사용하여 관련 소스 파일(`*.cpp`, `*.h`, `*.py`)을 식별하고, 함수 시그니처█
+  및 데이터 구조를 파악합니다.                                                                                                █
+  *   **Mermaid 생성:** 분석 결과를 바탕으로 Mermaid 시퀀스 다이어그램 코드를 생성합니다.                                     █
+  *   **데이터 흐름 추적:** 각 데이터 변환 단계별 변수명 및 데이터 타입을 명확히 명시합니다.                                  █
+  *   **함수 I/O 표:** `read_file`을 사용하여 각 함수의 실제 시그니처를 확인하고, 표 형식으로 정리합니다.                     █
+  *   **pybind11 분석:** `pybind11` 바인딩 코드를 집중적으로 분석하여 C++-Python 간 데이터 타입 매핑을 상세히 기술합니다.     █
+  *   **테스트:** 각 분석 항목에 대한 검증 방안을 제시합니다. (예: 특정 함수 호출 시 예상되는 출력 값 검증)                   █
+
+
+#+end_src
+
+#+begin_src markdown
+
+이 프로젝트의 전체 구조와 데이터 흐름을 '시스템 아키텍처' 관점에서 완벽하게 분석해줘
+  특히 비디오 프레임이 입력되어 서버로 전송되기까지의 과정을 중심으로, 아래 4가지 항목에 맞춰 정리해줘.
+
+  ### 1. 전체 시스템 & 스레드 아키텍처 (Mermaid Diagram)
+  - Main UI Thread, Video Thread, AI Thread, gRPC Thread 간의 상호작용을 Mermaid 시퀀스 다이어그램(Sequence Diagram)으로
+  그려줘.
+  - 각 스레드 간의 동기화 방법(Event: hAIStart, hAIFinish 등)이 다이어그램에 명시되어야 해.
+
+  ### 2. 데이터 라이프사이클 (Data Lifecycle Flow)
+  - 비디오 프레임 하나가 생성되어 소멸(전송)될 때까지의 단계를 5단계로 나누어 설명해줘.
+  - 각 단계에서 데이터가 어떤 변수에 담기고, 어떻게 변환되는지 추적해줘.
+  - 예: `cv::Mat` (Raw) -> `numpy.array` (Python Input) -> `vector<double>` (Python Output) -> `vector<Point3f>` (C++ Logic)
+  -> `Protobuf Frame` (Network)
+
+  ### 3. 핵심 함수 I/O 분석표 (Table)
+  - 주요 함수들의 입력(Input)과 출력(Output) 데이터 타입, 그리고 역할을 표로 정리해줘.
+  - 포함해야 할 함수:
+    1. `AIThread` (gRPCFileClientDlg.cpp)
+    2. `SendFrames` (gRPCThread_.h)
+    3. `GetMotionStatusFromMP` (gRPCThread_.h)
+    4. `EncodeFrame` (gRPCThread_.h)
+    5. `DrawImageBMP` (VideoUtil)
+
+  ### 4. C++ <-> Python 데이터 변환 상세
+  - `pybind11`을 통해 C++의 `cv::Mat`이 Python 함수로 들어갔다가, 어떤 형태의 결과값으로 다시 C++로 돌아오는지 코드 레벨에서
+  데이터 타입 위주로 분석해줘.
+
+  **추가 요구사항:**
+
+  *   **코드베이스 탐색:** `codebase_investigator`를 사용하여 관련 소스 파일(`*.cpp`, `*.h`, `*.py`)을 식별하고, 함수 시그니처
+  및 데이터 구조를 파악합니다.
+  *   **Mermaid 생성:** 분석 결과를 바탕으로 Mermaid 시퀀스 다이어그램 코드를 생성합니다.
+  *   **데이터 흐름 추적:** 각 데이터 변환 단계별 변수명 및 데이터 타입을 명확히 명시합니다.
+  *   **함수 I/O 표:** `read_file`을 사용하여 각 함수의 실제 시그니처를 확인하고, 표 형식으로 정리합니다.
+  *   **pybind11 분석:** `pybind11` 바인딩 코드를 집중적으로 분석하여 C++-Python 간 데이터 타입 매핑을 상세히 기술합니다
+  *   **테스트:** 각 분석 항목에 대한 검증 방안을 제시합니다. (예: 특정 함수 호출 시 예상되는 출력 값 검증)
+
+#+end_src

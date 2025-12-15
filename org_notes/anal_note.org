@@ -128,6 +128,311 @@ message SubmitResultResponse {
     *   처리된 결과는 `CgRPCFileClientDlg`로 전달되어, UI에 인식된 문장, 진행 상황 또는 기타 관련 정보를 표시하여 사용자에게 피드백을 제공합니다.
 ```
 
+* 데이터 흐름 분석-1
+코드베이스 분석이 완료되었습니다. 이제부터 요청하신 4가지 항목에 맞춰 시스템 아키텍처 분석 결과를 정리해 드리겠습니다.
+
+*** 1. 전체 시스템 & 스레드 아키텍처 (Mermaid Diagram)
+이 시스템은 4개의 주요 스레드가 MFC의 Event 객체를 통해 동기화하며 상호작용하는 구조입니다.
+
+- *Main UI Thread*: 사용자의 입력을 받고, 화면을 갱신하며 다른 스레드를 생성하고 관리합니다.
+- *gRPC Thread (=gRPCSend=)*: 주 작업 루프를 실행합니다. 비디오 파일을 읽고, 프레임을 추출한 뒤, AI Thread에 처리를 요청하고, 그 결과를 서버에 전송하는 전체 흐름을 관장합니다.
+- *AI Thread (=AIThread=)*: gRPC Thread의 요청을 받아 =cv::Mat= 프레임을 입력받습니다. 내장된 Python 인터프리터를 통해 MediaPipe 같은 AI 모델을 실행하여 Skeleton Landmark(=vector<Point3f>=)를 추출하고 결과를 반환합니다.
+- *Video Thread (=VideoPlay=)*: (사용자가 재생 버튼을 눌렀을 때) 별도로 비디오를 화면에 재생하는 역할을 합니다. 주 데이터 처리 흐름과는 독립적으로 동작합니다.
+
+*상호작용 흐름:*
+
+1. =gRPC Thread=가 비디오 프레임을 =CgRPCFileClientDlg::m_cap_img=에 준비합니다.
+2. =gRPC Thread=가 =SetEvent(hAIStart)=를 호출하여 =AI Thread=를 깨웁니다.
+3. =AI Thread=는 =m_cap_img=를 가져와 Python AI 모듈로 처리하고, 결과 Skeleton을 =m_sgcp_vtSkeletonMP=에 저장합니다.
+4. =AI Thread=가 작업 완료 후 =SetEvent(hAIFinish)=를 호출합니다.
+5. =gRPC Thread=는 =WaitForSingleObject(hAIFinish, ...)= 대기 상태에서 깨어나 =m_sgcp_vtSkeletonMP= 결과를 확인합니다.
+6. 결과를 =Frame= protobuf 메시지로 인코딩하여 서버에 스트리밍 전송합니다.
+7. 이 과정이 비디오의 지정된 범위 끝까지 반복됩니다.
+
+#+begin_src mermaid
+sequenceDiagram
+    participant MainUI as Main UI Thread
+    participant gRPC as gRPC Thread
+    participant AI as AI Thread
+
+    MainUI->>gRPC: Start gRPCSend Thread
+    activate gRPC
+
+    loop For each video frame
+        gRPC->>gRPC: 1. Read frame from video file
+        gRPC->>gRPC: 2. Pre-process frame (ROI, Resize)
+        gRPC-->>AI: 3. SetEvent(hAIStart)
+
+        activate AI
+        AI->>AI: 4. Process frame (cv::Mat) with Python model
+        AI->>AI: 5. Store skeleton (vector<Point3f>)
+        AI-->>gRPC: 6. SetEvent(hAIFinish)
+        deactivate AI
+
+        gRPC->>gRPC: 7. Wait for hAIFinish
+        gRPC->>gRPC: 8. Get skeleton data
+        gRPC->>gRPC: 9. Encode frame and skeleton to Protobuf
+        gRPC->>Server: 10. Send Frame message
+    end
+
+    gRPC-->>MainUI: Finish processing
+    deactivate gRPC
+#+end_src
+
+*** 2. 데이터 라이프사이클 (Data Lifecycle Flow)
+비디오 프레임 하나의 생성부터 소멸(전송)까지의 과정은 다음과 같이 5단계로 나눌 수 있습니다.
+
+1. *캡처 (Capture):*
+   - *위치*: =gRPCThread_.h=의 =SendFrames= 함수 내 =while= 루프
+   - *변수*: =cv::Mat img=
+   - *설명*: =cv::VideoCapture::read()= 또는 =cap >> img= 를 통해 비디오 파일로부터 원본 프레임(BGR, 3-channel)이 =cv::Mat= 형태로 메모리에 로드됩니다.
+2. *전처리 (Pre-processing):*
+   - *위치*: =gRPCThread_.h=의 =SendFrames= 함수 내 =while= 루프
+   - *변수*: =cv::Mat roi=, =cv::Mat resize_roi_img=, =CgRPCFileClientDlg::m_cap_img=
+   - *설명*: 원본 =img= 에서 사용자가 지정한 =m_roi=(Region of Interest) 영역만큼 =cv::Mat roi= 로 잘라냅니다. 이 =roi= 이미지는 성능을 위해 320px 너비 기준으로 리사이즈되어 다이얼로그의 멤버 변수인 =m_cap_img= 에 저장됩니다. 이 변수가 AI 스레드로 전달될 데이터입니다.
+3. *AI 추론 (AI Inference):*
+   - *위치*: =gRPCFileClientDlg.cpp= 의 =AIThread= 함수
+   - *데이터 변환*: =cv::Mat= (C++) → =numpy.array= (Python Input) → =vector<Point3f>= (Python Output)
+   - *설명*: =hAIStart= 이벤트로 =AIThread= 가 실행되면, =m_cap_img=를 =pybind11= type caster를 통해 Python의 =numpy.array=로 변환하여 AI 함수에 전달합니다. AI 함수는 MediaPipe를 이용해 자세를 추정하고, 그 결과인 3D 좌표 리스트를 =std::vector<cv::Point3f>= 형태로 반환받아 =m_sgcp_vtSkeletonMP= 멤버 변수에 저장합니다.
+4. *후처리 및 분석 (Post-processing & Analysis):*
+   - *위치*: =gRPCThread_.h= 의 =SendFrames= 함수
+   - *변수*: =std::vector<cv::Point3f> m_sgcp_vtSkeletonMP=
+   - *설명*: =hAIFinish= 이벤트 후, =gRPC Thread= 는 =m_sgcp_vtSkeletonMP=에 저장된 skeleton 데이터를 사용하여 =GetMotionStatusFromMP=, =HandTurnDetector::update= 등의 함수를 호출합니다. 이를 통해 손의 상태, 모션의 종류, 방향 전환 여부 등을 분석하여 프레임 전송 여부를 결정합니다.
+5. *직렬화 및 전송 (Serialization & Transmission):*
+   - *위치*: =gRPCThread_.h= 의 =EncodeFrame= 및 =SendFrames= 함수
+   - *데이터 변환*: =cv::Mat=, =vector<Point3f>= → =vision::raw::v1::Frame= (Protobuf)
+   - *설명*: 전송이 결정되면, =EncodeFrame= 함수가 호출됩니다. 이 함수는 2단계의 =roi= 이미지(=cv::Mat=)와 3단계의 =m_sgcp_vtSkeletonMP =(=vector<Point3f>)= 를 =ksl_sentence_recognition.proto= 에 정의된 =Frame= protobuf 메시지 형식으로 직렬화합니다. 이미지 데이터는 =bytes= 필드로, skeleton 좌표는 =repeated Point3= 필드로 변환되어 =writer->Write(frame)= 을 통해 서버로 전송됩니다.
+
+*** 3. 핵심 함수 I/O 분석표 :ATTACH:
+:PROPERTIES:
+:ID:       cf4bfb85-ccba-4070-8b97-c6b2df8c00d1
+:END:
+| 함수명                 | 파일 위치               | 입력 (Input)                                                                                 | 출력 (Output)                                                   | 역할                                                                                                             |
+|-----------------------+-----------------------+---------------------------------------------------------------------------------------------+----------------------------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| AIThread              | gRPCFileClientDlg.cpp | LPVOID pParam (this 포인터). 내부적으로 m_cap_img (cv::Mat) 사용                                 | UINT (스레드 종료 코드). 내부적으로 m_sgcp_vtSkeletonMP (vector) 저장 | hAIStart 이벤트 수신 후 m_cap_img → Python AI 모듈 전달. skeleton 결과 → m_sgcp_vtSkeletonMP 저장. hAIFinish 이벤트 발생 |
+| SendFrames            | gRPCThread_.h         | const std::string& session_id                                                               | void                                                           | 비디오 프레임 순차 읽기. AIThread 처리 요청. skeleton 데이터와 프레임 이미지 → gRPC 스트림 전송                               |
+| GetMotionStatusFromMP | gRPCFileClientDlg.cpp | int cur_motion_status, vector(Point3f) cur_mp                                               | int (새로운 모션 상태)                                            | MediaPipe skeleton 분석. 손 위치 기반 상태 판단: 준비, 수어 발화, 급격 동작 등                                             |
+| EncodeFrame           | gRPCThread_.h         | const cv::Mat& img, const string& session_id, int index, int flag, vector(Point3f) mpPose3D | Frame* out (출력 파라미터)                                        | cv::Mat 이미지와 skeleton 데이터 → Frame Protobuf 메시지 직렬화                                                       |
+| DrawImageBMP          | VideoUtil-v1.1.h      | CWnd* wnd, Mat frame, int x, int y, ...                                                     | void                                                           | OpenCV Mat → MFC Picture Control 표시용 GDI BMP 변환                                                              |
+
+#+ATTR_HTML: :width 1200px
+[[attachment:_20251215_114155screenshot.png]]
+
+*** 4. C++ <-> Python 데이터 변환 상세
+C++과 Python 간의 데이터 변환은 =gRPCFileClientDlg.h=에 정의된 =pybind11::detail::type_caster<cv::Mat>= 커스텀 캐스터를 통해 *메모리 복사 없이(zero-copy)* 효율적으로 이루어집니다.
+
+*1. C++ =cv::Mat= → Python =numpy.ndarray= (함수 호출 시)*
+
+- *과정*: C++ 코드에서 Python 함수를 호출하며 =cv::Mat= 객체를 인자로 넘길 때 =type_caster=의 =cast= 함수가 실행됩니다.
+- *동작 방식*:
+  1. =cv::Mat= 객체의 내부 정보를 읽습니다: =rows=, =cols=, =channels=, =type=, 그리고 데이터 버퍼의 시작 주소(=mat.data=).
+  2. 이 정보를 바탕으로 =numpy.ndarray=를 생성하기 위한 메타데이터(=buffer_info=)를 구성합니다. 이 메타데이터에는 데이터 타입, 차원(shape), 그리고 각 차원의 보폭(strides) 정보가 포함됩니다.
+  3. 핵심은 =buffer_info=의 첫 번째 인자로 =mat.data=, 즉 C++ =cv::Mat=이 관리하는 *메모리 버퍼의 포인터*를 그대로 넘긴다는 점입니다.
+  4. =pybind11::array=는 이 =buffer_info=를 받아 =numpy.ndarray=를 생성합니다. 이 =numpy= 배열은 데이터를 직접 소유하지 않고, C++의 =cv::Mat= 버퍼를 직접 참조(wrapping)하게 됩니다.
+- *결과*: Python 함수는 C++ 메모리를 직접 읽고 처리하는 =numpy.ndarray=를 받게 되므로, 이미지 데이터 복사에 따른 오버헤드가 없습니다.
+
+*2. Python =numpy.ndarray= → C++ =cv::Mat= (함수 반환 시)*
+
+- *과정*: Python 함수가 =numpy.ndarray=를 반환하면, =type_caster=의 =load= 함수가 이 객체를 C++ =cv::Mat=으로 변환하기 위해 실행됩니다.
+- *동작 방식*:
+  1. Python으로부터 받은 =handle obj=를 =pybind11::array=로 캐스팅합니다.
+  2. 배열의 =request()= 메소드를 호출하여 =buffer_info=를 요청합니다. 여기에는 =numpy= 배열의 차원, 데이터 타입, 데이터 시작 주소(=info.ptr=) 등의 정보가 담겨있습니다.
+  3. =cv::Mat= 생성자 =cv::Mat(rows, cols, type, data_pointer)=를 호출하여 =cv::Mat= 객체를 생성합니다.
+  4. 이때 데이터 포인터로 =info.ptr=, 즉 Python =numpy= 배열이 관리하는 *메모리 버퍼의 포인터*를 그대로 사용합니다.
+- *결과*: C++ 코드는 Python 메모리를 직접 참조하는 =cv::Mat= 래퍼(wrapper) 객체를 받게 됩니다. 이 또한 메모리 복사가 발생하지 않습니다. 다만, 반환된 =cv::Mat=의 생명주기는 Python 객체의 생명주기에 의존하므로, 필요시 =.clone()=을 통해 데이터를 복사하여 소유권을 C++로 가져와야 합니다.
+
+이러한 제로카피 방식은 고해상도 비디오 프레임을 실시간으로 처리해야 하는 이 시스템의 성능에 매우 중요합니다.
+
+* 데이터 흐름 분석-2
+=codebase_investigator= 를 통한 분석이 완료되었습니다. 결과를 바탕으로 프로젝트의 시스템 아키텍처를 요청하신 4가지 항목에 맞춰 상세히 정리해 드립니다.
+
+*** 1. 전체 시스템 & 스레드 아키텍처 (Mermaid Diagram)
+이 시스템은 MFC C++ 애플리케이션으로, UI, AI 처리, 네트워크 통신을 분리하기 위해 멀티 스레드 아키텍처를 사용합니다.
+
+- *Main UI Thread (=CgRPCFileClientDlg=):* 사용자의 입력을 받아 gRPC Thread를 시작하고, Video Thread를 통해 화면을 갱신하는 메인 스레드입니다.
+- *gRPC Thread (=gRPCSend=):* 핵심 워커 스레드입니다. 비디오 프레임을 읽고, AI Thread에 처리를 요청한 뒤, 그 결과를 받아 키 프레임 여부를 판단합니다. 키 프레임은 Protobuf 메시지로 인코딩되어 서버로 전송됩니다.
+- *AI Thread (=AIThread=):* =gRPC Thread=로부터 =hAIStart= 이벤트를 받아 활성화됩니다. =cv::Mat= 이미지를 =pybind11=을 통해 Python 함수로 넘겨 자세 추정(Pose Estimation)을 수행하고, 결과인 스켈레톤 데이터를 C++로 반환한 뒤 =hAIFinish= 이벤트를 발생시켜 작업 완료를 알립니다.
+- *Video Thread (=VideoPlay=):* UI에 비디오를 재생하는 역할만 독립적으로 수행합니다.
+
+아래는 스레드 간의 상호작용을 나타낸 Mermaid 시퀀스 다이어그램입니다.
+
+#+begin_src mermaid
+sequenceDiagram
+    participant MainUI as Main UI Thread
+    participant gRPCThread as gRPC Thread
+    participant AIThread as AI Thread
+    participant Server as gRPC Server
+
+    MainUI->>gRPCThread: 전송 시작 (OnBnClickedButton9)
+    activate gRPCThread
+    gRPCThread->>gRPCThread: SendFrames() 루프 시작
+    loop 모든 비디오 프레임에 대해
+        gRPCThread->>gRPCThread: 프레임 읽기 (cap >> img)
+        gRPCThread->>AIThread: AI 처리 요청 (SetEvent(hAIStart))
+        activate AIThread
+        AIThread->>AIThread: Python 자세 추정 함수 호출
+        AIThread-->>gRPCThread: AI 처리 완료 (SetEvent(hAIFinish))
+        deactivate AIThread
+        gRPCThread->>gRPCThread: AI 완료 대기 (WaitForSingleObject(hAIFinish))
+        gRPCThread->>gRPCThread: 모션 분석 및 키 프레임 판단
+        alt 키 프레임일 경우
+            gRPCThread->>gRPCThread: 프레임 인코딩 (EncodeFrame)
+            gRPCThread->>Server: Protobuf 메시지 전송 (writer->Write)
+        end
+    end
+    gRPCThread-->>MainUI: 전송 완료
+    deactivate gRPCThread
+#+end_src
+
+*** 2. 데이터 라이프사이클 (Data Lifecycle Flow)
+비디오 프레임 하나가 생성되어 서버로 전송되기까지의 과정은 다음과 같은 5단계로 이루어집니다.
+
+1. *생성 (C++):* =gRPCThread_.h=의 =SendFrames= 함수 내에서 =cv::VideoCapture=가 비디오 파일로부터 프레임 하나를 읽어 =cv::Mat img= 변수에 저장합니다. 이 이미지는 분석에 필요한 영역(ROI)만 잘라내어 =cv::Mat pDlg->m_cap_img=에 담깁니다.
+2. *AI 분석 요청 (C++ -> Python):* =AIThread=에서 =pDlg->m_cap_img=(=cv::Mat=)가 =pybind11::cast=를 통해 Python의 =mediapipe_pose_func= 함수로 전달됩니다. 이 과정에서 =cv::Mat=은 =pybind11=에 의해 자동으로 *NumPy 배열*로 변환됩니다.
+3. *AI 결과 반환 (Python -> C++):* Python 함수는 =[[x1, y1, z1], [x2, y2, z2], ...]= 형태의 *리스트(list of lists of doubles)*를 반환합니다. 이 값은 =.cast<std::vector<std::vector<double>>>()=를 통해 C++의 =std::vector<std::vector<double>>= 타입으로 변환됩니다.
+4. *데이터 가공 (C++):* C++로 변환된 스켈레톤 데이터는 최종적으로 =std::vector<cv::Point3f>= 타입의 =pDlg->m_sgcp_vtSkeletonMP= 변수에 저장되어 모션 분석 및 인코딩에 사용됩니다.
+5. *인코딩 및 전송 (C++ -> Protobuf):* =EncodeFrame= 함수가 원본 =cv::Mat= 이미지와 =vector<cv::Point3f>= 스켈레톤 데이터를 입력받아, =ksl_sentence_recognition.proto=에 정의된 *=Frame= Protobuf 메시지*로 직렬화(serialize)한 후 gRPC 스트림을 통해 서버로 전송합니다.
+
+*** 3. 핵심 함수 I/O 분석표
+주요 함수의 입력(Input), 출력(Output), 그리고 역할은 다음과 같습니다.
+
+| 함수                    | 입력 (Input)                                                        | 출력 (Output)                                             | 역할                                                                                                                          |
+|-------------------------+---------------------------------------------------------------------+-----------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------|
+| *AIThread*              | =pDlg->m_cap_img= (cv::Mat), =hAIStart= (Event)                     | =pDlg->m_sgcp_vtSkeletonMP= (vector), =hAIFinish= (Event) | =hAIStart= 이벤트 수신 시, 입력된 이미지로 Python 자세 추정 모듈을 호출하고 스켈레톤 결과를 저장한 뒤 =hAIFinish= 이벤트 발생 |
+| *SendFrames*            | =session_id= (string), 비디오 파일 경로, 프레임 범위                | (없음)                                                    | 프레임 읽기, AI 처리 조율, 모션 분석, 인코딩, gRPC 전송까지의 전체 데이터 파이프라인을 관리하는 메인 루프                     |
+| *GetMotionStatusFromMP* | =cur_motion_status= (int), =cur_mp= (vector)                        | =motion_status= (int)                                     | 손의 위치 등 스켈레톤 데이터를 기반으로 '준비', '발화 중' 등 수어 상태를 판단하는 C++ 상태 머신                               |
+| *EncodeFrame*           | =img= (cv::Mat), =session_id=, =index=, =flag=, =mpPose3D= (vector) | =out= (protobuf Frame*)                                   | =cv::Mat= 이미지와 스켈레톤 데이터를 네트워크 전송을 위한 Protobuf =Frame= 메시지로 직렬화                                    |
+| *DrawImageBMP*          | =wnd= (CWnd*), =frame= (cv::Mat), 좌표                              | (없음)                                                    | =VideoUtil=에 포함된 유틸리티 함수로, =cv::Mat= 객체를 MFC UI의 특정 창에 렌더링                                              |
+
+*** 4. C++ <-> Python 데이터 변환 상세
+C++과 Python 간의 데이터 변환은 =gRPCFileClientDlg.cpp=의 =AIThread= 함수 내에서 =pybind11=을 통해 이루어집니다.
+
+- *C++에서 Python으로 (=cv::Mat= -> =numpy.array=):* C++의 =cv::Mat= 객체(=dst_img=)가 Python 함수로 직접 전달됩니다. =pybind11=의 내장 캐스팅 기능이 =cv::Mat=을 Python에서 사용 가능한 NumPy 배열로 자동으로 변환해줍니다. (내부적으로 =pybind11_opencv=와 같은 바인딩 라이브러리가 필요할 수 있습니다.)
+
+  #+begin_src cpp
+  // gRPCFileClientDlg.cpp 내 AIThread 함수
+
+  // pybind11::cast가 cv::Mat을 NumPy 배열로 자동 변환하여 func_mp_pose 함수에 전달
+  auto result_pose_mp = func_mp_pose(pybind11::cast(dst_img));
+  #+end_src
+
+- *Python에서 C++로 (=list= -> =std::vector=):* Python 함수가 반환한 Python 객체(중첩 리스트)는 =.cast<T>()= 메소드를 통해 명시된 C++ 타입으로 변환됩니다.
+
+  #+begin_src cpp
+  // gRPCFileClientDlg.cpp 내 AIThread 함수
+
+  // Python의 반환값(list of lists)을 C++의 vector<vector<double>>로 변환
+  auto mp_result = result_pose_mp.cast<std::vector<std::vector<double>>>();
+  #+end_src
+
+* 데이터 흐름 분서-3
+분석이 완료되었습니다. =gRPCKSLDetectorClient=는 *MFC 기반의 멀티스레드 아키텍처*를 가지며, *Python(MediaPipe)과 C++(Heuristic Logic)의 하이브리드 방식*으로 동작합니다. 요청하신 4가지 항목에 대한 상세 분석 결과입니다.
+
+*** 1. 전체 시스템 & 스레드 아키텍처 (Mermaid Diagram) :ATTACH:
+:PROPERTIES:
+:ID:       ea8432d1-3f72-4394-895c-54974c912d53
+:END:
+이 시스템은 *Event(=hAIStart=, =hAIFinish=)* 를 통해 =gRPC Thread=와 =AI Thread=가 강하게 동기화(Synchronous)되어 동작하는 구조입니다.
+
+[[attachment:_20251215_122418screenshot.png]]
+
+#+begin_src mermaid
+sequenceDiagram
+    autonumber
+    participant gRPC as gRPC Thread<br/>(Function: SendFrames)
+    participant AI as AI Thread<br/>(Function: AIThread)
+    participant Python as Python Engine<br/>(Module: ACR.mp_detect)
+
+    Note over gRPC: 1. Creation (Raw Input)\nVar: img, roi\nType: cv::Mat
+    gRPC->>gRPC: Read frame from video file into img\nCrop img to ROI
+
+    Note over gRPC: 2. Shared Memory Write\nVar: m_cap_img\nType: cv::Mat
+    gRPC->>gRPC: Resize ROI and assign to m_cap_img
+
+    gRPC->>AI: SetEvent(hAIStart)\n(Trigger AI Processing)
+    activate AI
+
+    Note right of gRPC: gRPC Thread Blocked\nWaiting for hAIFinish...
+
+    Note over AI: 3. Python Conversion (Input)\nVar: (internal)\nType: numpy.ndarray
+    AI->>Python: Call func_mp_pose with m_cap_img\n(Implicit pybind11 cast)
+    activate Python
+
+    Note over Python: Inference (MediaPipe)
+
+    Python-->>AI: Return Result
+
+    deactivate Python
+
+    Note over AI: 4. Python Conversion (Output)\nVar: mp_result\nType: vector<vector<double>>\nVar: m_sgcp_vtSkeletonMP\nType: vector<Point3f>
+    AI->>AI: Cast Python result to mp_result\nReconstruct to m_sgcp_vtSkeletonMP
+
+    AI-->>gRPC: SetEvent(hAIFinish)\n(Signal Completion)
+    deactivate AI
+
+    gRPC->>gRPC: Wake Up (Wait Finished)
+
+    Note over gRPC: 5. Logic & Serialization\nVar: frame\nType: vision::raw::v1::Frame
+    gRPC->>gRPC: EncodeFrame(roi, m_sgcp_vtSkeletonMP)\nSerialize to Protobuf Message
+
+    gRPC->>gRPC: writer->Write(frame)\n(Stream to Server)
+
+#+end_src
+
+- *동기화 포인트:* =gRPC Thread=는 AI 처리가 끝날 때까지 멈춰 있습니다(=WaitForSingleObject=). 즉, 전체 프레임 처리 속도는 Python AI 모델의 추론 속도에 종속됩니다.
+
+*** 2. 데이터 라이프사이클 (Data Lifecycle Flow)
+비디오 프레임이 생성되어 전송되기까지의 5단계 변환 과정입니다.
+
+1. *Creation (Raw Input):*
+   - =gRPCThread_.h= :: =SendFrames=
+   - =cv::VideoCapture=에서 =cv::Mat img=로 원본 프레임을 읽습니다.
+   - 설정된 ROI(관심 영역)로 자르고(=img(m_roi)=), 필요시 320px 너비로 리사이즈하여 * =cv::Mat m_cap_img= * (멤버 변수)에 저장합니다.
+2. *Bridge (C++ to Python):*
+   - =gRPCFileClientDlg.cpp= :: =AIThread=
+   - =m_cap_img=가 =pybind11=의 =type_caster=를 통해 * =numpy.ndarray= * 로 변환되어 Python 함수 =func_mp_pose=로 전달됩니다. (Data Copy 발생 가능성 있음, type_caster 구현에 따라 다름)
+3. *Inference (Python Logic):*
+   - Python (=ACR.mp_detect=) 내부에서 MediaPipe를 수행하고, 결과(Skeleton Joints)를 반환합니다.
+   - 반환값은 =list of lists= 형태(=[[x...], [y...], [z...]]=)로 추정되며, C++로 돌아오면서 * =std::vector<std::vector<double>>= * 로 캐스팅됩니다.
+4. *Logic & Serialization (C++):*
+   - =gRPCFileClientDlg.cpp= :: =AIThread=
+   - Python 결과가 *=std::vector<cv::Point3f> m_sgcp_vtSkeletonMP=* 로 변환되어 저장됩니다.
+   - =gRPCThread_.h= 에서 이 좌표 데이터를 =HandTurnDetector= (C++ 클래스)에 입력하여 동작(Turn) 여부를 판별합니다.
+5. *Transmission (Network):*
+   - =gRPCThread_.h= :: =EncodeFrame=
+   - ROI 이미지(=cv::Mat=)와 골격 데이터(=vector<Point3f>=)가 * =ksl_sentence_recognition::Frame=  (Protobuf Message)* 로 직렬화됩니다.
+   - 최종적으로 gRPC =writer->Write(frame)= 을 통해 서버로 스트리밍됩니다.
+
+*** 3. 핵심 함수 I/O 분석표 (Table)
+| 함수명                    | 파일 위치             | Input (Parameters)                               | Output (Return)    | 핵심 역할                                                                                              |
+|---------------------------+-----------------------+--------------------------------------------------+--------------------+--------------------------------------------------------------------------------------------------------|
+| *=AIThread=*              | gRPCFileClientDlg.cpp | =LPVOID pParam= (Dialog 포인터)                  | =UINT= (0)         | =hAIStart= 이벤트를 대기하다가, =m_cap_img=를 Python에 전달하고 결과를 =m_sgcp_vtSkeletonMP=에 저장    |
+| *=SendFrames=*            | gRPCThread_.h         | =string session_id=                              | =void=             | 비디오 루프를 돌며 이미지 캡처, AI 스레드 트리거, C++ 로직 수행, gRPC 전송을 총괄                      |
+| *=GetMotionStatusFromMP=* | gRPCFileClientDlg.cpp | =int cur_status=, =vector<Point3f> mp=           | =int= (New Status) | 이전 프레임의 골격 좌표와 비교하여 정지/말하기/급격동작 상태를 천이(State Machine)                     |
+| *=EncodeFrame=*           | gRPCThread_.h         | =Mat img=, =vector<Point3f> mp=, =Frame* out= 등 | =bool=             | OpenCV 이미지와 3D 좌표를 Protobuf 메시지 포맷(=vision::raw::v1::Frame=)으로 변환(직렬화)              |
+| *=DrawImageBMP=*          | VideoUtil             | =CWnd* pWnd=, =Mat img= 등                       | =void=             | OpenCV의 =Mat= 데이터를 Windows MFC 컨트롤(Picture Control)에 그리기 위해 GDI 비트맵으로 변환하여 출력 |
+
+*** 4. C++ <-> Python 데이터 변환 상세 (pybind11)
+이 프로젝트는 =pybind11=을 사용하여 C++와 Python 간의 데이터 변환을 *명시적인 Type Caster*를 통해 처리하고 있습니다. (=gRPCFileClientDlg.h=에 정의됨)
+
+*1. =cv::Mat= → =numpy.ndarray= (C++ to Python)* * *코드 위치:* =pybind11::detail::type_caster<cv::Mat>::cast= * *동작:* =cv::Mat=의 메타데이터(rows, cols, channels)를 =pybind11::buffer_info= 구조체에 매핑하여 Numpy 배열을 생성합니다. * *특이사항:* =mat.data= 포인터를 공유하여 *Zero-Copy*에 가깝게 전달하려 하지만, Python 측에서 수명 관리를 위해 복사가 일어날 수 있습니다. 지원 타입은 =uchar=, =int32=, =float=로 제한되어 있습니다.
+
+*2. Python List → =std::vector<cv::Point3f>= (Python to C++)* * *코드 위치:* =AIThread= 내부 * *변환 과정:* ```cpp // 1. Python 리턴값을 임시 객체로 받음 auto result_pose_mp = func_mp_pose(pybind11::cast(dst_img));
+
+#+begin_example
+// 2. Python List -> C++ Vector<Vector<double>> (자동 캐스팅)
+auto mp_result = result_pose_mp.cast<std::vector<std::vector<double>>>();
+
+// 3. Vector<Vector<double>> -> Vector<Point3f> (수동 변환)
+// Python 반환값이 [ [x1, x2...], [y1, y2...], [z1, z2...] ] (SoA 구조)라고 가정됨
+pDlg->m_sgcp_vtSkeletonMP.push_back(
+    Point3f(mp_result[0][k], mp_result[1][k], mp_result[2][k])
+);
+```
+#+end_example
+
+- *데이터 구조:* Python 함수는 =N x 3= (Point list)가 아니라 *=3 x N= (Dimension list)* 형태의 데이터를 반환하는 것으로 보입니다. 이를 C++ 루프에서 =Point3f= 구조체 배열(=AoS=)로 재조립합니다.
+
 * AIThread
 ** gemini-web
 `AIThread`는 메인 로직(비디오 재생 또는 gRPC 전송 스레드)으로부터 영상 데이터가 준비되었다는 신호를 받으면, 내장된 Python 인터프리터를 통해 MediaPipe 로직을 수행하고 결과를 C++ 구조체에 저장합니다.
