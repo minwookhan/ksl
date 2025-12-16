@@ -12,47 +12,91 @@ RAPID_MOTION_STATUS = 2
 READY_LOCATION = 700 # Y-axis threshold for hand position in C++ (relative to 1080p)
 RAPID_DISTANCE = 0.1 # Normalized distance threshold for rapid motion
 
-@dataclass
+import math
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
+from src.ai import SkeletonPoint
+import numpy as np
+
+# Reflecting C++ macros/constants from gRPCFileClientDlg.h
+RESET_MOTION_STATUS = -1
+READY_MOTION_STATUS = 0
+SPEAK_MOTION_STATUS = 1
+RAPID_MOTION_STATUS = 2
+
+READY_LOCATION = 700 # Y-axis threshold for hand position in C++ (relative to 1080p)
+RAPID_DISTANCE = 0.1 # Normalized distance threshold for rapid motion
+
 class HandTurnDetector:
     """
-    Porting the concept of C++ HandTurnDetector.hpp to Python.
-    Detects abrupt changes in hand movement (e.g., start of sign language gesture).
+    Port of C++ HandTurnDetector class.
+    Detects hand turns based on angle change and deceleration.
     """
-    prev_pos: Optional[Tuple[float, float]] = None
-    prev_velocity: Optional[Tuple[float, float]] = None
-    state: str = "IDLE" # Example states: IDLE, ACCELERATING, DECELERATING
+    def __init__(self, angle_deg_th: float = 30.0, speed_ratio_th: float = 0.8, min_speed: float = 1e-3):
+        self.angle_rad_th = angle_deg_th * math.pi / 180.0
+        self.speed_ratio_th = speed_ratio_th
+        self.min_speed = min_speed
+        self.reset()
 
     def reset(self):
         """Resets the detector's internal state."""
-        self.prev_pos = None
-        self.prev_velocity = None
-        self.state = "IDLE"
+        self.prev_pos: Optional[np.ndarray] = None
+        self.prev_vel: Optional[np.ndarray] = None
+        self.has_prev_pos = False
+        self.has_prev_vel = False
+        self.frame_idx = 0
 
     def update(self, current_pos: Tuple[float, float], dt: float) -> bool:
         """
-        Updates the detector with new hand position and time delta,
-        returning True if an abrupt motion (turn) is detected.
-        Input: current_pos (Tuple[float, float], 2D normalized wrist coordinates)
-               dt (float, time elapsed since previous frame)
-        Output: bool (True if abrupt motion detected)
+        Updates the detector with new hand position and time delta.
+        Returns True if a "Turn + Slow" event is detected.
         """
-        # This is a simplified/dummy implementation based on the C++ original
-        # as the full C++ logic involves velocity, angle changes, and state transitions.
-        # For now, if position changes significantly, consider it a "turn".
-        if self.prev_pos is None:
-            self.prev_pos = current_pos
+        pos = np.array(current_pos, dtype=float)
+        detected = False
+
+        if not self.has_prev_pos:
+            self.prev_pos = pos
+            self.has_prev_pos = True
+            self.frame_idx += 1
             return False
 
-        current_np_pos = np.array(current_pos)
-        prev_np_pos = np.array(self.prev_pos)
-        
-        # Check for significant displacement
-        if np.linalg.norm(current_np_pos - prev_np_pos) > 0.05: # Arbitrary threshold for dummy detection
-            self.prev_pos = current_pos
-            return True
-        
-        self.prev_pos = current_pos
-        return False
+        # Calculate velocity
+        if dt > 1e-6:
+            vel = (pos - self.prev_pos) * (1.0 / dt)
+        else:
+            vel = pos - self.prev_pos
+
+        speed = np.linalg.norm(vel)
+
+        if self.has_prev_vel:
+            prev_speed = np.linalg.norm(self.prev_vel)
+
+            # Check logic only if moving fast enough
+            if prev_speed > self.min_speed:
+                # Unit vectors
+                u1 = self.prev_vel / prev_speed
+                u2 = vel / (speed + 1e-6)
+
+                # Dot product for angle
+                dot = np.dot(u1, u2)
+                # Clamp for acos safety
+                dot = max(-1.0, min(1.0, dot))
+                dtheta = math.acos(dot)
+
+                # Speed ratio
+                ratio = speed / (prev_speed + 1e-6)
+
+                # Condition: Angle > Threshold AND Deceleration (Ratio < Threshold)
+                if dtheta > self.angle_rad_th and ratio < self.speed_ratio_th:
+                    detected = True
+
+        # Update state for next frame
+        self.prev_pos = pos
+        self.prev_vel = vel
+        self.has_prev_vel = True
+        self.frame_idx += 1
+
+        return detected
 
 def get_ref_hl_2d_points_mp(joints: List[SkeletonPoint]) -> List[Tuple[float, float]]:
     """

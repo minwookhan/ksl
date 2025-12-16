@@ -22,3 +22,13 @@ __pycache__/
 # OS/IDE
 .DS_Store
 .idea/
+.aider*
+.env
+**/*.pyc
+**/__pycache__/
+.pytest_cache
+.venv/
+ksl-cli/.venv/
+output/
+packet.bin
+5.mp4

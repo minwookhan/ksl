@@ -2,3 +2,16 @@ prompt_notes/
 org_notes/
 *.org
 *.task
+.env
+.venv/
+ksl-cli/.venv/
+.pytest_cache/
+*.mp4
+output/
+**/*.pyc
+**/__pycache__/
+.pytest_cache
+*.bin
+.pytest_cache
+.git
+.aider*

@@ -50,9 +50,29 @@ if __name__ == '__main__':
     try:
         while True:
             if not frame_queue.empty():
-                image_bytes = frame_queue.get()
-                frame = decode_frame(image_bytes)
+                # Item is now the full Frame protobuf message
+                frame_msg = frame_queue.get()
+                
+                # Check if it's the expected object (legacy tuple check removed for clarity as we changed service.py)
+                # But to be safe against mixed versions (though local), we assume it's the object.
+                # Access fields directly
+                
+                # Protobuf fields: data, width, height, type, flag
+                image_bytes = frame_msg.data
+                width = frame_msg.width
+                height = frame_msg.height
+                cv_type = frame_msg.type
+                flag = frame_msg.flag
+
+                frame = decode_frame(image_bytes, width, height, cv_type)
+                
                 if frame is not None:
+                    # Visual indication for Keyframe (Flag 0)
+                    if flag == 0:
+                        cv2.rectangle(frame, (0, 0), (frame.shape[1]-1, frame.shape[0]-1), (0, 0, 255), 5)
+                        cv2.putText(frame, "KEYFRAME", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 
+                                    1.5, (0, 0, 255), 3)
+                        
                     cv2.imshow('KSL Detector Stream', frame)
 
             key = cv2.waitKey(1) & 0xFF

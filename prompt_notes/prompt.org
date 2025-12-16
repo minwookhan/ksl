@@ -282,3 +282,41 @@ Step 0에서는 “포팅 스펙 문서”부터 작성.
 
 **[Phase 0]부터 시작해 주세요.**
     #+end_src
+* server prompt
+#+begin_src markdown
+Act as a Senior Python Developer specializing in gRPC, OpenCV, and TDD.
+
+**Project Goal:**
+Create a Python gRPC server inside the `./server` directory.
+The server receives an image stream from a client (`ksl-cli`), decodes the bytes, and displays/updates the image in a single popup window.
+
+**Project Structure (Existing Files):**
+- Root
+  - `protos/ksl_sentence_recognition.proto`
+  - `src/ksl_sentence_recognition_pb2.py` (Already Generated)
+  - `src/ksl_sentence_recognition_pb2_grpc.py` (Already Generated)
+  - `server/` (Target directory for new server code)
+
+**Critical Constraints:**
+1.  **Import Path:** Since the generated code is in `../src` relative to `./server`, your code MUST add `../src` to `sys.path` before importing the pb2 modules.
+2.  **Thread Safety (Queue Pattern):**
+    * **gRPC Thread:** Receives the request and *only* pushes image bytes to a `queue.Queue`.
+    * **Main Thread:** Runs an infinite loop, checks the Queue, decodes bytes via `cv2.imdecode`, and uses `cv2.imshow` + `cv2.waitKey(1)`.
+3.  **TDD Workflow:** You must strictly follow the Test-Driven Development cycle.
+
+**Workflow Rules (STRICTLY FOLLOW):**
+1.  **Phase 1: Planning.** Output a detailed **TODO List**.
+    * Include "Setup `server` dir & Import Test" as the first technical step.
+2.  **Phase 2: Execution.**
+    * Pick the next TODO item.
+    * Create the **Unit Test** file first (e.g., inside `./server/tests/`).
+    * Create the **Implementation** file (inside `./server/`).
+    * Explain how to run the test.
+3.  **Phase 3: Confirmation.**
+    * **STOP COMPLETELY** after finishing one step.
+    * Ask: "Do you confirm this step? (Type 'CONFIRM' to proceed)".
+    * **DO NOT** output the next step until I explicitly type "CONFIRM".
+
+**First Action:**
+Analyze the structure and constraints, then generate the **TODO List** to start the project.
+#+end_src

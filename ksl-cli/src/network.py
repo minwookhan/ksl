@@ -80,16 +80,32 @@ def encode_frame(
         image = np.ascontiguousarray(image)
 
     # Get OpenCV type equivalent for protobuf.type
-    # For np.uint8, cv2.CV_8U (0) would be equivalent, but protobuf type is int32. 
-    # The C++ code uses `src.type()` which returns CV_8UC3 for BGR image. 
-    # When converting to RGB, it's still CV_8UC3.
-    # For simplicity, we'll use the numpy dtype num, which for uint8 is 0.
-    # A more precise mapping might be needed if the server specifically checks this.
-    cv_type_equivalent = image.dtype.num # For uint8, this is 0
-    if image.ndim == 3: # Assuming 3 channels for color images
-        cv_type_equivalent = cv2.CV_8UC3 # A common representation for 3-channel uint8
-    elif image.ndim == 2: # Grayscale
-        cv_type_equivalent = cv2.CV_8UC1 # Or similar for 1-channel uint8
+    channels = 1
+    if image.ndim == 3:
+        channels = image.shape[2]
+    
+    depth = 0
+    if image.dtype == np.uint8:
+        depth = cv2.CV_8U
+    elif image.dtype == np.int8:
+        depth = cv2.CV_8S
+    elif image.dtype == np.uint16:
+        depth = cv2.CV_16U
+    elif image.dtype == np.int16:
+        depth = cv2.CV_16S
+    elif image.dtype == np.int32:
+        depth = cv2.CV_32S
+    elif image.dtype == np.float32:
+        depth = cv2.CV_32F
+    elif image.dtype == np.float64:
+        depth = cv2.CV_64F
+    else:
+        # Fallback or raise error? For now fallback to uint8 equivalent logic if unknown
+        depth = cv2.CV_8U
+
+    # CV_MAKETYPE(depth, cn) equivalent
+    # ((depth) & 7) + ((cn) - 1) << 3
+    cv_type_equivalent = (depth & 7) + ((channels - 1) << 3)
     
     frame_data = image.tobytes()
 

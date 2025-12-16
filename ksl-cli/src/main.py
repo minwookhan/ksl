@@ -85,6 +85,7 @@ def process_video_stream(
                 )
                 
                 # Update hand turn detectors (using dummy dt for now)
+                is_keyframe = False
                 if len(current_skeleton) > 16: # Ensure wrist landmarks exist
                     right_wrist = (current_skeleton[16].x, current_skeleton[16].y)
                     left_wrist = (current_skeleton[15].x, current_skeleton[15].y)
@@ -93,33 +94,60 @@ def process_video_stream(
 
                     if right_hand_detector.update(right_wrist, DUMMY_DT):
                         logger.info(f"Frame {frame_count}: Right hand turn detected!")
+                        is_keyframe = True
                     if left_hand_detector.update(left_wrist, DUMMY_DT):
                         logger.info(f"Frame {frame_count}: Left hand turn detected!")
+                        is_keyframe = True
+
+                # Determine flag to send
+                # Default to current motion status
+                # Proto definition: 0: START, 1: NORMAL, 2: END
+                sending_flag = current_motion_status
+                
+                if is_keyframe:
+                    # Force flag to 0 (START) when a keyframe is detected to signal the server
+                    sending_flag = 0 
+                    logger.info(f"Frame {frame_count}: Sending KEYFRAME with Flag 0 (START)")
+
+                # Visualization (Pop window update)
+                try:
+                    # Convert RGB (from VideoLoader) to BGR (for OpenCV Display)
+                    vis_img = cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2BGR)
+
+                    if is_keyframe:
+                        # Highlight Keyframe
+                        cv2.putText(vis_img, "KEYFRAME DETECTED", (20, 50), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                        cv2.rectangle(vis_img, (0, 0), (vis_img.shape[1]-1, vis_img.shape[0]-1), (0, 0, 255), 4)
+                    
+                    cv2.imshow("KSL Client Stream", vis_img)
+                    # Process GUI events (1ms delay)
+                    if cv2.waitKey(1) & 0xFF == 27: # ESC to stop strictly if needed
+                        pass 
+                except Exception as e:
+                    logger.debug(f"Visualization error (headless?): {e}")
 
                 # Encode to Protobuf Frame
-                encoded_frame = encode_frame(
-                    session_id=session_id,
-                    index=frame_count,
-                    flag=current_motion_status,
-                    image=frame_image_rgb,
-                    skeleton=current_skeleton
-                )
-                
-                # Write to file if enabled
-                if output_file:
-                    # Write size delimiter (optional but good for stream parsing) + bytes
-                    # Or just raw bytes as requested. Let's write size-delimited or raw?
-                    # Request said "protobuf packet bytes stream". Usually needs length prefix.
-                    # For simplicity, just write raw bytes of serialized message.
-                    # To read back, one needs to know boundaries (Varint delimiter).
-                    # Here we just write serialized string.
-                    serialized = encoded_frame.SerializeToString()
-                    # output_file.write(len(serialized).to_bytes(4, byteorder='big')) # Length prefix
-                    output_file.write(serialized) 
-                    output_file.flush()
+                # Only send if it is a keyframe
+                if is_keyframe:
+                    encoded_frame = encode_frame(
+                        session_id=session_id,
+                        index=frame_count,
+                        flag=sending_flag,
+                        image=frame_image_rgb,
+                        skeleton=current_skeleton
+                    )
+                    yield encoded_frame
+                # Write to file if enabled (also only keyframes now, or all? Usually stream matches file)
+                # If user wants ALL frames in file but ONLY keyframes in stream, logic needs split.
+                # Assuming "send to server" implies "output of this pipeline", so file also gets only keyframes.
+                if output_file and is_keyframe:
+                     serialized = encoded_frame.SerializeToString()
+                     output_file.write(serialized) 
+                     output_file.flush()
 
                 prev_skeleton = current_skeleton # Update for next frame
-                yield encoded_frame
+                # yield encoded_frame # Removed: only yield inside if block
         
         # Stream frames
         # We need to handle the case where gRPC fails but we still want to generate frames for file output
@@ -155,6 +183,7 @@ def process_video_stream(
         logger.exception(f"An unexpected error occurred during processing: {e}")
         sys.exit(1)
     finally:
+        cv2.destroyAllWindows()
         if 'output_file' in locals() and output_file:
             output_file.close()
             logger.info("Closed output file.")
