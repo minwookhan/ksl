@@ -1,0 +1,36 @@
+syntax = "proto3";
+package vision.raw.v1;
+
+enum FrameFlag {
+  FRAME_FLAG_UNSPECIFIED = 0;
+  FRAME_FLAG_START = 1;
+  FRAME_FLAG_MIDDLE = 2;
+  FRAME_FLAG_END = 3;
+}
+
+message Frame {
+  string session_id = 1;
+  uint64 index = 2;
+  FrameFlag flag = 3;
+
+  uint32 width = 4;
+  uint32 height = 5;
+  uint32 channels = 6;   // 예: BGR=3, GRAY=1
+  uint32 step = 7;       // 한 행(row)의 byte 수 (cv::Mat::step)
+
+  bytes data = 8;        // img.total() * img.elemSize() raw 바이트
+}
+
+message StartRequest {}
+
+message SubmitResultRequest {
+  string session_id = 1;
+  string text = 2;
+}
+
+message SubmitResultResponse {}
+
+service SequenceService {
+  rpc StartSequence(StartRequest) returns (stream Frame);
+  rpc SubmitResult(SubmitResultRequest) returns (SubmitResultResponse);
+}

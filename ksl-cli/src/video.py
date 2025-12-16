@@ -91,3 +91,27 @@ class VideoLoader:
         rgb_frame = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
         
         return rgb_frame
+
+def calculate_optical_flow_value(prev_gray: np.ndarray, curr_gray: np.ndarray) -> float:
+    """
+    Calculates the average motion magnitude between two grayscale frames.
+    Uses Dense Optical Flow (Farneback) to approximate the motion value.
+    Input: prev_gray, curr_gray (uint8 grayscale images)
+    Output: float (average motion magnitude, normalized or raw depending on usage)
+    """
+    if prev_gray is None or curr_gray is None:
+        return 0.0
+    
+    if prev_gray.shape != curr_gray.shape:
+        return 0.0
+
+    # Parameters matching typical real-time usage
+    flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 
+                                        pyr_scale=0.5, levels=3, winsize=15, 
+                                        iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
+    
+    # Calculate magnitude of flow vectors
+    magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    
+    # Return average magnitude
+    return np.mean(magnitude)

@@ -10,7 +10,7 @@ import cv2
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.config import AppConfig
-from src.video import VideoLoader, parse_roi
+from src.video import VideoLoader, parse_roi, calculate_optical_flow_value
 from src.ai import MediaPipePoseEstimator, SkeletonPoint
 from src.logic import HandTurnDetector, get_rough_hand_status_from_mp, get_motion_status_from_mp, \
     RESET_MOTION_STATUS, READY_MOTION_STATUS, SPEAK_MOTION_STATUS, RAPID_MOTION_STATUS
@@ -25,6 +25,10 @@ except ImportError:
 # Configure root logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Constants from MFC
+OPTICAL_FLOW_THRESH = 0.45
+OPTICAL_FLOW_HOLD_FRAME = 3
 
 def setup_logging(level: int):
     """Sets up logging for the application."""
@@ -50,6 +54,11 @@ def process_video_stream(
     current_motion_status: int = READY_MOTION_STATUS # Initial state
     right_hand_detector = HandTurnDetector()
     left_hand_detector = HandTurnDetector()
+    
+    # MFC KeyFrame Logic States
+    prev_gray: Optional[np.ndarray] = None
+    speak_start_flag = False
+    frozen_flag = 0
 
     try:
         logger.info(f"Starting video processing for session: {session_id}")
@@ -64,7 +73,7 @@ def process_video_stream(
                 logger.error(f"Failed to open output file: {e}")
 
         def frame_generator() -> Iterator[pb2.Frame]:
-            nonlocal frame_count, prev_skeleton, current_motion_status # For updating outer scope variables
+            nonlocal frame_count, prev_skeleton, current_motion_status, prev_gray, speak_start_flag, frozen_flag # For updating outer scope variables
             
             for frame_image_rgb in video_loader.get_frames():
                 frame_count += 1
@@ -73,6 +82,12 @@ def process_video_stream(
                 else:
                     logger.debug(f"Processing frame {frame_count}")
 
+                # 1. Optical Flow Calculation
+                curr_gray = cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2GRAY)
+                avg_motion = 0.0
+                if prev_gray is not None:
+                    avg_motion = calculate_optical_flow_value(prev_gray, curr_gray)
+                
                 # AI Inference
                 current_skeleton = pose_estimator.process_frame(frame_image_rgb)
 
@@ -84,41 +99,65 @@ def process_video_stream(
                     prev_skeleton
                 )
                 
-                # Update hand turn detectors (using dummy dt for now)
-                is_keyframe = False
-                if len(current_skeleton) > 16: # Ensure wrist landmarks exist
-                    right_wrist = (current_skeleton[16].x, current_skeleton[16].y)
-                    left_wrist = (current_skeleton[15].x, current_skeleton[15].y)
-                    
-                    DUMMY_DT = 1 / 30.0 
-
-                    if right_hand_detector.update(right_wrist, DUMMY_DT):
-                        logger.info(f"Frame {frame_count}: Right hand turn detected!")
-                        is_keyframe = True
-                    if left_hand_detector.update(left_wrist, DUMMY_DT):
-                        logger.info(f"Frame {frame_count}: Left hand turn detected!")
-                        is_keyframe = True
-
-                # Determine flag to send
-                # Default to current motion status
-                # Proto definition: 0: START, 1: NORMAL, 2: END
-                sending_flag = current_motion_status
+                # 2. Pre-condition Check: Hand Status
+                # Must be != 0 (Ready/Down) to proceed with KeyFrame logic
+                hand_status = get_rough_hand_status_from_mp(current_skeleton)
                 
-                if is_keyframe:
-                    # Force flag to 0 (START) when a keyframe is detected to signal the server
-                    sending_flag = 0 
-                    logger.info(f"Frame {frame_count}: Sending KEYFRAME with Flag 0 (START)")
+                is_turn_detected = False
+                
+                if hand_status != 0:
+                    # 3. Hand Turn Detection
+                    if len(current_skeleton) > 16: # Ensure wrist landmarks exist
+                        right_wrist = (current_skeleton[16].x, current_skeleton[16].y)
+                        left_wrist = (current_skeleton[15].x, current_skeleton[15].y)
+                        
+                        DUMMY_DT = 1 / 30.0 
+
+                        if right_hand_detector.update(right_wrist, DUMMY_DT):
+                            logger.debug(f"Frame {frame_count}: Right turn detected")
+                            is_turn_detected = True
+                        if left_hand_detector.update(left_wrist, DUMMY_DT):
+                            logger.debug(f"Frame {frame_count}: Left turn detected")
+                            is_turn_detected = True
+                
+                # Logic: Turn Detected -> Set speak_start_flag
+                if is_turn_detected:
+                    speak_start_flag = True
+                
+                should_send_keyframe = False
+
+                # 4. Final Send Condition: Turn happened + Motion Stabilized + Not Frozen
+                if speak_start_flag and avg_motion < OPTICAL_FLOW_THRESH and frozen_flag == 0:
+                    should_send_keyframe = True
+                    # Reset/Set flags
+                    # In MFC, speakstartflag seems to persist until next logic or simple trigger? 
+                    # Assuming we reset it after successful send to wait for next turn.
+                    # Or does MFC allow multiple stops per turn? The snippet says "Holdcnt++", "writer->Write".
+                    # Usually we consume the flag.
+                    # speak_start_flag = False # Depending on desired behavior. Let's consume it.
+                    # Actually, if we consume it, we miss subsequent stops if the hand moves again without turning.
+                    # But 'HandTurnDetector' is the trigger.
+                    # Let's keep it simple: Consume flag to avoid continuous sending on static hand.
+                    speak_start_flag = False 
+                    frozen_flag = OPTICAL_FLOW_HOLD_FRAME
+
+                # Decrement frozen flag
+                if frozen_flag > 0:
+                    frozen_flag -= 1
+                
+                prev_gray = curr_gray # Update for next frame
 
                 # Visualization (Pop window update)
                 try:
                     # Convert RGB (from VideoLoader) to BGR (for OpenCV Display)
                     vis_img = cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2BGR)
 
-                    if is_keyframe:
+                    if should_send_keyframe:
                         # Highlight Keyframe
                         cv2.putText(vis_img, "KEYFRAME DETECTED", (20, 50), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
                         cv2.rectangle(vis_img, (0, 0), (vis_img.shape[1]-1, vis_img.shape[0]-1), (0, 0, 255), 4)
+                        logger.info(f"Frame {frame_count}: Sending KEYFRAME (AvgMotion: {avg_motion:.2f})")
                     
                     cv2.imshow("KSL Client Stream", vis_img)
                     # Process GUI events (1ms delay)
@@ -129,25 +168,23 @@ def process_video_stream(
 
                 # Encode to Protobuf Frame
                 # Only send if it is a keyframe
-                if is_keyframe:
+                if should_send_keyframe:
                     encoded_frame = encode_frame(
                         session_id=session_id,
                         index=frame_count,
-                        flag=sending_flag,
+                        flag=0, # KEYFRAME is START (0)
                         image=frame_image_rgb,
                         skeleton=current_skeleton
                     )
                     yield encoded_frame
-                # Write to file if enabled (also only keyframes now, or all? Usually stream matches file)
-                # If user wants ALL frames in file but ONLY keyframes in stream, logic needs split.
-                # Assuming "send to server" implies "output of this pipeline", so file also gets only keyframes.
-                if output_file and is_keyframe:
+                
+                # Write to file if enabled (also only keyframes now)
+                if output_file and should_send_keyframe:
                      serialized = encoded_frame.SerializeToString()
                      output_file.write(serialized) 
                      output_file.flush()
 
                 prev_skeleton = current_skeleton # Update for next frame
-                # yield encoded_frame # Removed: only yield inside if block
         
         # Stream frames
         # We need to handle the case where gRPC fails but we still want to generate frames for file output

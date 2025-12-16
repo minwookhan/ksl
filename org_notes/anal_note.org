@@ -782,6 +782,7 @@ MediaPipe는 21개 랜드마크의 '위치'를 제공할 뿐, "이것이 '주먹
        - 손 크기에 대해 정규화(Normalization)하여 특징 벡터(Feature Vector)를 만듭니다.
    3.  **모델 학습**: 준비된 특징 벡터와 라벨을 사용하여 SVM(Support Vector Machine), RandomForest, 또는 간단한 신경망(MLP) 같은 분류 모델을 학습시킵니다.
    4.  **추론**: 실시간으로 MediaPipe에서 얻은 랜드마크 데이터로 특징 벡터를 만들어 학습된 모델에 입력하면, 어떤 제스처인지 분류된 결과가 나옵니다.
+**
 ** chatgpt
 *** MediaPipe 기반 손동작 인식 전체 흐름
 
@@ -1109,6 +1110,242 @@ MediaPipe는 21개 랜드마크의 '위치'를 제공할 뿐, "이것이 '주먹
    // 처리 완료 신호 발생
    SetEvent(pDlg->hAIFinish);
    #+END_SRC
+* KeyFrame 알고리즘-1
+MFC 소스(gRPCFileClientDlg.cpp 및 HandTurnDetector.hpp)에서 KeyFrame(수어 시작 지점, speakstartflag)을 감지하는 알고리즘은 광학 흐름(Optical Flow) 기반의 모션 감지와 손 궤적 기반의 방향 전환 감지(Turn Detection) 가 결합된 형태입니다.
+
+핵심 조건은 다음과 같습니다:
+
+1. 전제 조건 (Pre-condition):
+   - GetRoughHandStatusFromMP: 손이 '준비 상태(Ready)'가 아니어야 합니다(즉, 손이 일정 높이 이상 올라와 있어야 함).
+   - GetMotionStatusFromMP: 현재 동작 상태가 SPEAK_MOTION_STATUS(수어 중)이거나 일정 프레임 이상 지났어야 합니다.
+2. 핵심 트리거 (Key Trigger) - HandTurnDetector:
+   - HandTurnDetector::update 함수가 true를 반환해야 합니다.
+   - 알고리즘 상세 (=HandTurnDetector.hpp=):
+     - 손의 속도(Velocity) 와 이동 방향(Direction) 을 분석합니다.
+     - 조건 1 (방향 전환): 이동 방향의 각도 변화(dtheta)가 angleRadTh_ (기본 30도) 이상이어야 합니다.
+     - 조건 2 (감속): 속도가 이전 프레임 대비 speedRatioTh_ (기본 0.8, 즉 20% 감소) 이하로 줄어들어야 합니다. (Turn & Stop/Slow)
+     - 조건 3 (최소 속도): 너무 느린 움직임은 무시 (minSpeed_ 이상이어야 함).
+   - 즉, "손이 특정 방향으로 빠르게 이동하다가 방향을 30도 이상 꺾으면서 속도가 20% 이상 줄어드는 순간" 을 감지합니다.
+3. 보조 조건 (Optical Flow):
+   - speakstartflag가 1로 설정되면(Turn 감지 후), 이후 avgMotion(Optical Flow 평균값)이 OPTICALFLOW_THRESH(0.45) 미만으로 떨어지는지 확인하여 '정지(Hold)' 구간을 찾기도 합니다(Segmentation).
+* KeyFrame 알고리즘-2
+MFC 프로젝트(=gRPCFileClientDlg.cpp=, =HandTurnDetector.hpp=)에서 *KeyFrame(수어 시작 지점, =speakstartflag=)* 을 결정하는 알고리즘은 *1. 동작 상태 전제 조건*, *2. HandTurnDetector (방향 전환 감지)*, *3. Optical Flow (움직임 멈춤 감지)* 세 가지 단계가 복합적으로 작용합니다.
+이를 상세히 분석하면 다음과 같습니다.
+*** 1. 전제 조건 (Pre-condition)
+KeyFrame 감지 로직이 실행되기 위한 기본 조건입니다.
+
+- *손의 위치 상태 (=GetRoughHandStatusFromMP=)*:
+  - MediaPipe 스켈레톤 데이터를 기반으로 손이 *준비 상태(Ready Status)*, 즉 몸 아래로 내려가 있는지, 혹은 일정 높이(Y축 =READY_LOCATION=) 이상 올라와 있는지 확인합니다.
+  - *조건*: 손이 준비 상태(=0=)가 아니어야 합니다. (즉, 손이 올라와 있어야 함)
+- *동작 상태 (=GetMotionStatusFromMP=)*:
+  - 현재 동작이 *수어 발화 중(=SPEAK_MOTION_STATUS=)* 이거나, 영상 재생 후 일정 프레임(=MIN_FRAME=) 이상 지났는지 확인합니다.
+  - 이는 너무 이른 시점이나 손을 내리고 있을 때의 오탐지를 방지합니다.
+
+*** 2. 핵심: HandTurnDetector (방향 전환 및 감속 감지)
+이것이 KeyFrame을 결정하는 가장 중요한 트리거입니다. 손이 단순히 움직이는 것이 아니라, *동작의 의미 있는 변화(Turn)* 가 일어나는 순간을 포착합니다.
+
+- *입력*: 손목(Wrist)의 2D 좌표 (=x=, =y=)와 시간 간격(=dt=).
+- *로직 (=HandTurnDetector::update=)*:
+  1. *속도(Velocity) 계산*: 현재 위치와 이전 위치의 차이를 시간(=dt=)으로 나누어 속도 벡터를 구합니다.
+  2. *속력(Speed) 계산*: 속도 벡터의 크기를 구합니다.
+  3. *방향 변화(Angle Change) 계산*:
+     - 이전 속도 벡터(=u1=)와 현재 속도 벡터(=u2=)를 단위 벡터로 변환합니다.
+     - 두 벡터의 내적(Dot Product)을 통해 사이각(=dtheta=)을 구합니다.
+  4. *속도 비율(Speed Ratio) 계산*: 현재 속력 / 이전 속력 비율(=ratio=)을 구합니다.
+  5. *판정 조건 (AND 조건)*:
+     - *각도 변화 > 30도* (=dtheta > angleRadTh_=): 이동 방향이 30도 이상 꺾여야 합니다.
+     - *감속 (속도 줄어듦)* (=ratio < speedRatioTh_=): 속도가 이전 대비 80% 미만으로 줄어야 합니다. (즉, 20% 이상 감속)
+     - *최소 속도*: 너무 느린 움직임(노이즈)은 제외합니다.
+- *의미*: 손이 빠르게 뻗어나가다가 방향을 바꾸거나 멈칫하는 순간, 즉 *수어 동작의 '획'이 바뀌거나 시작되는 지점*을 의미합니다.
+
+*** 3. 보조: Optical Flow (모션 안정화 확인)
+=HandTurnDetector=가 트리거된 후, 추가적으로 영상의 픽셀 변화량(Optical Flow)을 확인하여 최종 전송 시점을 조율하기도 합니다.
+
+- =avgMotion < OPTICALFLOW_THRESH=: 화면 전체의 움직임이 일정 수준 이하로 안정화되었을 때.
+- =HandTurnDetector=가 감지되었을 때 =speakstartflag=를 1로 세팅하고, 이후 Optical Flow가 낮아지면(동작이 멈추면) 그때 데이터를 전송하고 =frozenflag=를 설정하여 중복 전송을 막습니다(Debouncing).
+- *MFC 코드 상의 흐름*: =cpp     if (Rhit || Lhit) { // HandTurnDetector 감지됨         speakstartflag = 1;     }     else if (speakstartflag && avgMotion < 0.45 && frozenflag == 0) {         // Turn 감지 이후 + 움직임이 잦아들었을 때 -> 최종 전송         EncodeFrame(...);         writer->Write(frame);         frozenflag = 3; // 3프레임 동안 전송 금지     }=
+
+*** 요약: MFC의 KeyFrame 결정 로직
+
+#+begin_quote
+*"손이 일정 높이 이상 올라와 있는 상태에서(1), 손목이 30도 이상 방향을 꺾으며 감속하는 순간(2)을 'Turn'으로 감지하고, 그 직후 손의 움직임이 잠시 멈추는 순간(3)을 수어 단어의 시작/끝으로 판단하여 서버로 전송한다."*
+
+#+end_quote
+
+현재 =ksl-cli=에 적용된 로직은 *2번(HandTurnDetector)* 까지는 완벽히 포팅되었으나, *3번(Optical Flow 및 speakstartflag 상태 관리)* 로직은 아직 구현되지 않고, Turn 감지 즉시 전송하도록 되어 있습니다. 더 정확한 타이밍을 원하신다면 3번 로직까지 추가해야 합니다.
+* KeyFrame -3
+--------------
+
+*** KeyFrame 결정 알고리즘 상세 분석
+이 알고리즘은 *"준비된 상태에서(Pre-condition) -> 손이 꺾이며 감속하는 순간을 포착하고(Turn Detection) -> 동작이 멈출 때(Optical Flow)"* 를 KeyFrame으로 판정합니다.
+
+**** 1단계: 전제 조건 및 상태 확인 (Pre-condition & State Check)
+가장 먼저, 현재 프레임이 분석할 가치가 있는 상태인지 확인합니다. 손이 너무 아래에 있거나(차렷 자세), 아직 분석 준비가 안 된 경우를 걸러냅니다.
+
+- *핵심 코드 (=gRPCFileClientDlg.cpp=)*:
+
+  #+begin_src cpp
+  // 1. 손 상태 확인 (0: Ready/Below Threshold, 1/2/3: Hand Up)
+  int hand_status = pDlg->GetRoughHandStatusFromMP(pDlg->m_sgcp_vtSkeletonMP);
+
+  // 2. 동작 상태 업데이트 (READY_MOTION_STATUS vs SPEAK_MOTION_STATUS)
+  motion_status = pDlg->GetMotionStatusFromMP(motion_status, pDlg->m_sgcp_vtSkeletonMP);
+
+  // 3. 조건 검사: 손이 올라와 있고(hand_status != 0), 수어 중이거나 일정 시간 경과 시
+  if (hand_status != 0 && (motion_status == SPEAK_MOTION_STATUS || frame_count > MIN_FRAME)) {
+      // ... 다음 단계 진입 ...
+  }
+  #+end_src
+
+- *예제 데이터 (Pseudo Data)*:
+
+  - *상황 A (무시)*:
+    - =LeftWrist.y = 0.8= (화면 하단, =READY_LOCATION=0.65=보다 큼 → 아래에 있음)
+    - =RightWrist.y = 0.8=
+    - *결과*: =hand_status = 0= (Ready). *Stop*. (다음 단계 진행 안 함)
+  - *상황 B (진입)*:
+    - =RightWrist.y = 0.4= (화면 상단, 가슴 높이)
+    - *결과*: =hand_status = 1= (Right Hand Up). *Pass*. (2단계로 진입)
+
+--------------
+
+**** 2단계: HandTurnDetector - 방향 전환 및 감속 감지 (The Trigger)
+손이 움직이다가 방향을 급격히 바꾸거나(Turn), 멈추기 위해 감속하는 순간을 '동작의 획'으로 간주하여 감지합니다. 이 단계가 *=speakstartflag=를 켜는 트리거*입니다.
+
+- *핵심 코드 (=HandTurnDetector.hpp=)*:
+
+  #+begin_src cpp
+  // 벡터 내적을 통한 각도 계산
+  float dot = u1.x * u2.x + u1.y * u2.y; // u1:이전단위벡터, u2:현재단위벡터
+  float dtheta = std::acos(dot);         // 사이각 (라디안)
+
+  // 속도 비율 계산 (현재속도 / 이전속도)
+  float ratio = speed / (prevSpeed + 1e-6f);
+
+  // 판정: 각도가 30도(0.52rad) 이상 꺾이고 AND 속도가 80% 미만으로 줄었을 때
+  if (dtheta > angleRadTh_ && ratio < speedRatioTh_) {
+      detected = true;
+  }
+  #+end_src
+
+- *예제 데이터 (Pseudo Data)*:
+
+  - *입력*:
+    - 이전 속도 벡터 (=prev_vel=): =(10, 0)= (오른쪽으로 빠르게 이동 중, 속력 10)
+    - 현재 속도 벡터 (=curr_vel=): =(5, 5)= (대각선 위로 이동 중, 속력 약 7.07)
+  - *계산*:
+    1. *각도 (=dtheta=)*: =(1,0)=과 =(0.707, 0.707)=의 사이각 = *45도* (Turn 발생! => 30도= 조건 만족)
+    2. *속도 비율 (=ratio=)*: =7.07 / 10.0= = *0.707* (70% 수준으로 감속됨! =< 0.8= 조건 만족)
+  - *결과*: *=detected = true=*.
+  - *Action*: =speakstartflag = 1= 로 설정. (전송 대기 상태 돌입)
+
+--------------
+
+**** 3단계: Optical Flow - 정지 확인 및 최종 전송 (Stabilization & Send)
+Turn 감지(2단계) 직후 바로 보내지 않고, 손이나 몸의 잔여 움직임이 잦아들어 *이미지가 선명해지는 순간(Stop)* 을 기다렸다가 전송합니다.
+
+- *핵심 코드 (=gRPCFileClientDlg.cpp=)*:
+
+  #+begin_src cpp
+  // 전체 화면(ROI)의 평균 움직임 양 계산 (Optical Flow)
+  double avgMotion = pDlg->GetMotionVauleWithOpticalFlow(roi);
+
+  // 조건: Turn이 감지되었었고(speakstartflag), 움직임이 안정화(avgMotion < 0.45) 되었으며, 쿨타임(frozenflag)이 아닐 때
+  if (speakstartflag && avgMotion < OPTICALFLOW_THRESH && frozenflag == 0) {
+      Holdcnt++;
+
+      // ★ 최종 전송 ★
+      EncodeFrame(roi, session_id, frameIndex, 1, ...);
+      writer->Write(frame);
+
+      // 중복 전송 방지 쿨타임 설정
+      frozenflag = OPTICAL_FLOW_HOLD_FRAME; // 3프레임
+  }
+  #+end_src
+
+- *예제 데이터 (Pseudo Data)*:
+
+  - *Frame 10 (Turn 감지 직후)*:
+    - =speakstartflag = 1= (2단계에서 설정됨)
+    - =avgMotion = 2.5= (아직 손이 떨리고 있음, => 0.45=)
+    - *결과*: 전송 보류.
+  - *Frame 12*:
+    - =speakstartflag = 1=
+    - =avgMotion = 0.1= (손이 딱 멈춤! =< 0.45=)
+    - =frozenflag = 0= (쿨타임 끝남)
+  - *결과*: *전송 실행 (Send Frame)*.
+  - *Action*: =frozenflag = 3= 설정. (Frame 13, 14, 15는 전송 안 함)
+* KeyFrame  전송 pseudo code
+=mfc_client=가 비디오 스트림에서 *KeyFrame을 선별하여 전송하는 전체 과정*을 Pseudo Code(의사 코드)로 정리했습니다.
+
+이 코드는 *"어떤 조건에서 프레임이 전송되고, 어떤 상황에서 무시되는지"*를 명확하게 보여줍니다.
+
+#+begin_src python
+# 초기 상태 변수 설정
+bool speakStartFlag = false;    # 수어 동작 시작 감지 여부 (Latching)
+int frozenCounter = 0;          # 전송 후 대기(Cooldown) 카운터
+const int COOLDOWN_FRAMES = 3;  # KeyFrame 전송 후 무시할 프레임 수
+const float MOTION_THRESH = 0.45; # 정지 상태로 판단할 모션 임계값
+
+# 비디오 스트림 처리 루프
+WHILE (비디오_재생중 AND 종료_아님) DO:
+
+    # 1. 데이터 획득
+    Frame currentFrame = VideoCapture.read();
+    List<Point3D> skeleton = Run_MediaPipe_AI(currentFrame); # 3D 관절 추출
+
+    # [조건 1] 스켈레톤 데이터가 유효한가?
+    IF (skeleton.isEmpty()) THEN:
+        CONTINUE; # 다음 프레임으로 (데이터 없음)
+
+    # [조건 2] 손이 "준비(Ready)" 상태가 아닌가? (즉, 손이 올라와 있는가?)
+    int handStatus = GetHandStatus(skeleton); # 0:Ready, 1:Right, 2:Left, 3:Both
+
+    IF (handStatus == 0) THEN:
+        CONTINUE; # 다음 프레임으로 (의미 없는 대기 동작)
+
+    # -----------------------------------------------------------
+    # 여기서부터는 유효한 동작 구간임
+    # -----------------------------------------------------------
+
+    # 3. 움직임 분석
+    float avgMotion = CalculateOpticalFlow(prevFrame, currentFrame); # 움직임 양 계산
+    bool isTurnDetected = DetectHandTurnOrDeceleration(skeleton);    # 회전/감속 감지
+
+    # 수어 발화 시작 감지 (한 번 true가 되면 유지됨)
+    IF (isTurnDetected) THEN:
+        speakStartFlag = true;
+
+    # [조건 3 & 4] 전송 결정 로직 (핵심)
+    # - 동작이 시작되었고 (speakStartFlag)
+    # - 손이 멈췄거나 매우 느리며 (avgMotion < THRESH)
+    # - 쿨다운 시간이 끝났을 때 (frozenCounter == 0)
+    IF (speakStartFlag == true AND avgMotion < MOTION_THRESH AND frozenCounter == 0) THEN:
+
+        # >>> KEYFRAME 전송 <<<
+        GrpcClient.Send(currentFrame, skeleton);
+
+        # 전송 후 쿨다운 설정 (중복 전송 방지)
+        frozenCounter = COOLDOWN_FRAMES;
+
+    # 4. 상태 관리
+    IF (frozenCounter > 0) THEN:
+        frozenCounter = frozenCounter - 1; # 매 프레임마다 카운터 감소
+
+END WHILE
+#+end_src
+
+*** 요약: 데이터 전송 흐름
+1. *AI 분석*: 매 프레임마다 MediaPipe를 돌려 관절(Skeleton)을 얻습니다.
+2. *필터링*: 관절 데이터가 없거나, 손이 허리춤(Ready 상태)에 있으면 즉시 무시합니다.
+3. *상태 감지*: 손을 비틀거나 속도를 줄이는 동작이 감지되면 =speakStartFlag=를 켜서 "지금부터 수어 중이다"라고 표시합니다.
+4. *KeyFrame 포착 (AND 조건)*:
+   - 수어 중(=speakStartFlag=)이면서,
+   - 손이 순간적으로 멈췄고(=avgMotion= 낮음),
+   - 방금 전송한 적이 없다면(=frozenCounter == 0=),
+   - *그제서야 서버로 프레임을 전송*합니다.
+5. *쿨다운*: 전송 직후 =frozenCounter=를 3으로 설정하여, 향후 3 프레임 동안은 손이 계속 멈춰 있어도 전송하지 않습니다. (중복 방지)
+
 * mediapipe 판단 과정 예제
 ** KeyFrame 결정 알고리즘의 상세 설명
 **주요 목적:** 사용자의 수어 동작 시퀀스에서 의미 있는 시작점, 정지 지점 또는 중요한 자세 변화를 나타내는 프레임을 'KeyFrame'으로 식별하여 gRPC 서버로 전송합니다.
