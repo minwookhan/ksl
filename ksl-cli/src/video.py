@@ -1,7 +1,10 @@
 import cv2
 import numpy as np
+import logging
 from typing import Generator, Tuple
 from src.config import AppConfig
+
+logger = logging.getLogger(__name__)
 
 def parse_roi(roi_str: str) -> Tuple[int, int, int, int]:
     """
@@ -23,19 +26,26 @@ class VideoLoader:
         """
         Yields preprocessed frames from the video file.
         """
-        cap = cv2.VideoCapture(str(self.config.video_path))
+        video_path = str(self.config.video_path)
+        logger.info(f"Opening video file: {video_path}")
+        cap = cv2.VideoCapture(video_path)
         
         try:
             if not cap.isOpened():
                 raise IOError(f"Cannot open video file: {self.config.video_path}")
             
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            logger.info(f"Video opened successfully. Total frames: {total_frames}")
+
             while True:
                 ret, frame = cap.read()
                 if not ret:
+                    logger.info("End of video reached or failed to read frame.")
                     break
                 
                 # Check if frame is valid
                 if frame is None or frame.size == 0:
+                    logger.warning("Empty frame read.")
                     continue
                     
                 processed_frame = self._preprocess(frame)
@@ -43,6 +53,7 @@ class VideoLoader:
                 
         finally:
             cap.release()
+            logger.info("VideoLoader released.")
     
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
         """

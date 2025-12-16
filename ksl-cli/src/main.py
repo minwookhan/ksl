@@ -125,16 +125,27 @@ def process_video_stream(
         # We need to handle the case where gRPC fails but we still want to generate frames for file output
         gen = frame_generator()
         
+        use_offline_mode = False
+        
         try:
+            # Explicitly check connection before passing generator to gRPC
+            # This prevents the generator from getting stuck in "executing" state inside gRPC if connection fails immediately
+            logger.info("Connecting to gRPC server...")
+            grpc_client.connect() 
+            logger.info("Connected to gRPC server. Starting stream.")
+            
             response_iterator = grpc_client.send_stream(gen)
             for response in response_iterator:
                 logger.info(f"Server response: {response.message}")
+
         except Exception as e:
-            logger.warning(f"gRPC streaming failed (Server might be down): {e}")
-            logger.info("Continuing processing in offline mode (saving to file if output path set)...")
-            
-            # Consume the rest of the generator to ensure processing continues
+            logger.warning(f"gRPC connection/streaming failed: {e}")
+            logger.info("Switching to offline mode (saving to file if output path set)...")
+            use_offline_mode = True
+
+        if use_offline_mode:
             try:
+                # Consume the rest of the generator to ensure processing continues
                 for _ in gen: 
                     pass
             except Exception as e_inner:
@@ -162,7 +173,7 @@ def main():
     parser.add_argument("--server", type=str, default="localhost:50051",
                         help="gRPC server address (default: localhost:50051)")
     parser.add_argument("--model-path", type=Path,
-                        default=Path("ksl-cli/protos/pose_landmarker_full.task"),
+                        default=Path("./protos/pose_landmarker_full.task"),
                         help="Path to the MediaPipe Pose Landmarker model (.task file)")
     parser.add_argument("--output", type=Path,
                         help="Optional: Path to save the raw protobuf packet bytes stream (.bin file)")
