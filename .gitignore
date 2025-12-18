@@ -32,3 +32,5 @@ ksl-cli/.venv/
 output/
 packet.bin
 5.mp4
+*.jpg
+*.png
