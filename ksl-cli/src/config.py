@@ -9,6 +9,8 @@ class AppConfig:
     video_path: Path
     roi: Tuple[int, int, int, int]  # (x, y, w, h)
     output_path: Optional[Path] = None
+    frame_range: Optional[Tuple[int, int]] = None  # (start_frame, end_frame)
+    save_keyframes_only: bool = False
     log_level: int = logging.INFO
     
     def __post_init__(self):

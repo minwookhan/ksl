@@ -59,6 +59,7 @@ def process_video_stream(
     prev_gray: Optional[np.ndarray] = None
     speak_start_flag = False
     frozen_flag = 0
+    saved_keyframe_count = 0
 
     try:
         logger.info(f"Starting video processing for session: {session_id}")
@@ -73,10 +74,20 @@ def process_video_stream(
                 logger.error(f"Failed to open output file: {e}")
 
         def frame_generator() -> Iterator[pb2.Frame]:
-            nonlocal frame_count, prev_skeleton, current_motion_status, prev_gray, speak_start_flag, frozen_flag # For updating outer scope variables
+            nonlocal frame_count, prev_skeleton, current_motion_status, prev_gray, speak_start_flag, frozen_flag, saved_keyframe_count # For updating outer scope variables
             
             for frame_image_rgb in video_loader.get_frames():
                 frame_count += 1
+
+                # Check frame range if specified
+                if config.frame_range:
+                    start_frame, end_frame = config.frame_range
+                    if frame_count < start_frame:
+                        continue
+                    if frame_count > end_frame:
+                        logger.info(f"Reached end of specified frame range ({end_frame}). Stopping.")
+                        break
+
                 if frame_count % 30 == 0:
                     logger.info(f"Processing frame {frame_count}")
                 else:
@@ -169,6 +180,18 @@ def process_video_stream(
                 # Encode to Protobuf Frame
                 # Only send if it is a keyframe
                 if should_send_keyframe:
+                    if config.save_keyframes_only:
+                        try:
+                            kf_dir = Path("keyFrame")
+                            kf_dir.mkdir(parents=True, exist_ok=True)
+                            kf_filename = kf_dir / f"keyframe_{frame_count:06d}.jpg"
+                            # Convert RGB to BGR for saving
+                            cv2.imwrite(str(kf_filename), cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2BGR))
+                            logger.info(f"Saved keyframe to {kf_filename}")
+                            saved_keyframe_count += 1
+                        except Exception as e:
+                            logger.error(f"Failed to save keyframe: {e}")
+
                     encoded_frame = encode_frame(
                         session_id=session_id,
                         index=frame_count,
@@ -192,21 +215,25 @@ def process_video_stream(
         
         use_offline_mode = False
         
-        try:
-            # Explicitly check connection before passing generator to gRPC
-            # This prevents the generator from getting stuck in "executing" state inside gRPC if connection fails immediately
-            logger.info("Connecting to gRPC server...")
-            grpc_client.connect() 
-            logger.info("Connected to gRPC server. Starting stream.")
-            
-            response_iterator = grpc_client.send_stream(gen)
-            for response in response_iterator:
-                logger.info(f"Server response: {response.message}")
-
-        except Exception as e:
-            logger.warning(f"gRPC connection/streaming failed: {e}")
-            logger.info("Switching to offline mode (saving to file if output path set)...")
+        if config.save_keyframes_only:
+            logger.info("Keyframe Only Mode enabled. Skipping gRPC connection.")
             use_offline_mode = True
+        else:
+            try:
+                # Explicitly check connection before passing generator to gRPC
+                # This prevents the generator from getting stuck in "executing" state inside gRPC if connection fails immediately
+                logger.info("Connecting to gRPC server...")
+                grpc_client.connect() 
+                logger.info("Connected to gRPC server. Starting stream.")
+                
+                response_iterator = grpc_client.send_stream(gen)
+                for response in response_iterator:
+                    logger.info(f"Server response: {response.message}")
+
+            except Exception as e:
+                logger.warning(f"gRPC connection/streaming failed: {e}")
+                logger.info("Switching to offline mode (saving to file if output path set)...")
+                use_offline_mode = True
 
         if use_offline_mode:
             try:
@@ -226,6 +253,8 @@ def process_video_stream(
             logger.info("Closed output file.")
         grpc_client.close()
         logger.info(f"Finished processing for session: {session_id}. Total frames: {frame_count}")
+        if config.save_keyframes_only:
+            logger.info(f"Total extracted keyframes: {saved_keyframe_count}")
 
 
 def main():
@@ -243,6 +272,10 @@ def main():
                         help="Path to the MediaPipe Pose Landmarker model (.task file)")
     parser.add_argument("--output", type=Path,
                         help="Optional: Path to save the raw protobuf packet bytes stream (.bin file)")
+    parser.add_argument("--frame", type=int, nargs=2, metavar=('START', 'END'),
+                        help="Optional: Process only a specific range of frames (e.g. 100 500)")
+    parser.add_argument("--keyframeOnly", type=int, choices=[0, 1], default=0,
+                        help="If 1, extract and save KeyFrames to ./keyFrame folder without sending to gRPC.")
     parser.add_argument("--log-level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="Set the logging level (default: INFO)")
@@ -262,6 +295,8 @@ def main():
             video_path=args.video_path,
             roi=parsed_roi,
             output_path=args.output,
+            frame_range=tuple(args.frame) if args.frame else None,
+            save_keyframes_only=bool(args.keyframeOnly),
             log_level=log_level_val
         )
 
