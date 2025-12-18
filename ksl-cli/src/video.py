@@ -94,10 +94,11 @@ class VideoLoader:
 
 def calculate_optical_flow_value(prev_gray: np.ndarray, curr_gray: np.ndarray) -> float:
     """
-    Calculates the average motion magnitude between two grayscale frames.
-    Uses Dense Optical Flow (Farneback) to approximate the motion value.
+    Calculates the average motion magnitude between two grayscale frames using Sparse Optical Flow (Lucas-Kanade).
+    Matches the C++ implementation to ensure consistent thresholding behavior.
+    
     Input: prev_gray, curr_gray (uint8 grayscale images)
-    Output: float (average motion magnitude, normalized or raw depending on usage)
+    Output: float (average motion magnitude of tracked points)
     """
     if prev_gray is None or curr_gray is None:
         return 0.0
@@ -105,13 +106,40 @@ def calculate_optical_flow_value(prev_gray: np.ndarray, curr_gray: np.ndarray) -
     if prev_gray.shape != curr_gray.shape:
         return 0.0
 
-    # Parameters matching typical real-time usage
-    flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 
-                                        pyr_scale=0.5, levels=3, winsize=15, 
-                                        iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
+    # 1. Detect feature points to track (Sparse)
+    # Parameters match typical C++ OpenCV defaults or common usage if not specified
+    feature_params = dict(maxCorners=300,
+                          qualityLevel=0.01,
+                          minDistance=7,
+                          blockSize=7)
     
-    # Calculate magnitude of flow vectors
-    magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    p0 = cv2.goodFeaturesToTrack(prev_gray, mask=None, **feature_params)
     
-    # Return average magnitude
-    return np.mean(magnitude)
+    # If no features found, motion is 0
+    if p0 is None:
+        return 0.0
+
+    # 2. Calculate Optical Flow (Lucas-Kanade)
+    lk_params = dict(winSize=(15, 15),
+                     maxLevel=2,
+                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    
+    p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None, **lk_params)
+
+    # 3. Calculate Average Motion of Valid Points
+    if p1 is not None:
+        # Select good points
+        good_new = p1[st == 1]
+        good_old = p0[st == 1]
+        
+        if len(good_new) == 0:
+            return 0.0
+            
+        # Calculate Euclidean distances
+        displacements = np.linalg.norm(good_new - good_old, axis=1)
+        
+        # Average magnitude
+        avg_motion = np.mean(displacements)
+        return float(avg_motion)
+        
+    return 0.0

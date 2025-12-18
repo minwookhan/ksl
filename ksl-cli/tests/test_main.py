@@ -2,6 +2,7 @@ import pytest
 import sys
 import os
 import argparse
+import numpy as np
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 import logging
@@ -15,7 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../src'
 from src.main import main, process_video_stream, setup_logging
 from src.config import AppConfig
 from src.ai import SkeletonPoint
-from ksl_sentence_recognition_pb2 import SubmitResultResponse
+from ksl_sentence_recognition_pb2 import SubmitResultResponse, Frame
 
 # --- Test setup_logging ---
 def test_setup_logging():
@@ -27,23 +28,36 @@ def test_setup_logging():
         assert mock_get_logger.call_count >= 3 
 
 # --- Test process_video_stream (Pipeline Integration) ---
+@patch('src.main.HandTurnDetector') # Patch the class used in main
 @patch('src.main.encode_frame')
-def test_process_video_stream(mock_encode_frame):
+def test_process_video_stream(mock_encode_frame, MockHandTurnDetector):
     # Setup Mocks
     mock_config = MagicMock(spec=AppConfig)
     mock_config.video_path = Path("dummy_video.mp4")
-    
+    mock_config.frame_range = None
+    mock_config.save_keyframes_only = False
+    mock_config.output_path = None
+
     mock_video_loader = MagicMock()
-    # Simulate 2 frames
-    mock_video_loader.get_frames.return_value = iter([MagicMock(), MagicMock()])
+    dummy_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    mock_video_loader.get_frames.return_value = iter([dummy_frame, dummy_frame])
     
     mock_pose_estimator = MagicMock()
+    # Hands UP (y=0.1 < 0.7) to ensure hand_status != 0
     mock_pose_estimator.process_frame.return_value = [SkeletonPoint(x=0.1, y=0.1, z=0.1)] * 33
     
+    # Configure HandTurnDetector mock instances
+    mock_detector_instance = MockHandTurnDetector.return_value
+    # Frame 1: Right=True, Left=False -> Turn Detected -> Send Skipped
+    # Frame 2: Right=False, Left=False -> No Turn -> Send Triggered
+    mock_detector_instance.update.side_effect = [True, False, False, False]
+
+    mock_frame = Frame(session_id="test", index=1, data=b'data')
+    mock_encode_frame.return_value = mock_frame
+    
     mock_grpc_client = MagicMock()
-    # Mock send_stream to consume the iterator and return a response iterator
     def side_effect_send_stream(iterator):
-        list(iterator) # Consume generator to trigger internal logic
+        list(iterator)
         return iter([SubmitResultResponse(session_id="test", frame_count=2, message="Done")])
     mock_grpc_client.send_stream.side_effect = side_effect_send_stream
 
@@ -53,7 +67,12 @@ def test_process_video_stream(mock_encode_frame):
     # Verifications
     assert mock_video_loader.get_frames.called
     assert mock_pose_estimator.process_frame.call_count == 2
-    assert mock_encode_frame.call_count == 2
+    # HandTurnDetector.update is True -> speak_start_flag = True
+    # avg_motion is 0 (black images) -> < THRESH
+    # frozen_flag is 0 initially.
+    # Frame 1: Sends keyframe. frozen_flag becomes 3.
+    # Frame 2: frozen_flag is 2. Skips sending.
+    assert mock_encode_frame.call_count == 1
     mock_grpc_client.send_stream.assert_called_once()
     mock_grpc_client.close.assert_called_once()
 

@@ -17,6 +17,15 @@ def create_skeleton_list(left_y, right_y, filler_y=0.9):
     # Create a list of 33 points (standard MediaPipe Pose)
     # Default filler_y=0.9 (Safe "Down" position, > 0.648)
     points = [SkeletonPoint(x=0.5, y=filler_y, z=0.1)] * 33
+    
+    # Set geometric reference points for Affine Transform (Identity mapping)
+    # Nose (0): (960, 400) -> (0.5, 0.3703)
+    points[0] = SkeletonPoint(x=0.5, y=0.3703, z=0.1)
+    # Left Shoulder (11): (1200, 500) -> (0.625, 0.4629)
+    points[11] = SkeletonPoint(x=0.625, y=0.4629, z=0.1)
+    # Right Shoulder (12): (720, 500) -> (0.375, 0.4629)
+    points[12] = SkeletonPoint(x=0.375, y=0.4629, z=0.1)
+
     points[15] = SkeletonPoint(x=0.5, y=left_y, z=0.1) # Left Wrist
     points[16] = SkeletonPoint(x=0.6, y=right_y, z=0.1) # Right Wrist
     return points
@@ -49,34 +58,47 @@ def dummy_skeleton_points_no_hands() -> List[SkeletonPoint]:
 def test_hand_turn_detector_reset_and_update():
     detector = HandTurnDetector()
     assert detector.prev_pos is None
-    assert detector.prev_velocity is None
-    assert detector.state == "IDLE"
+    assert detector.prev_vel is None
+    # state attribute removed
 
-    detector.update(current_pos=(0.1, 0.1), dt=0.033) # First update
-    assert detector.prev_pos == (0.1, 0.1)
-    
+    detector.update(current_pos=(0.1, 0.1), dt=0.033) # First update sets prev_pos
+    np.testing.assert_array_equal(detector.prev_pos, np.array([0.1, 0.1]))
+    assert detector.has_prev_pos is True
+
     # No significant change
     assert not detector.update(current_pos=(0.11, 0.11), dt=0.033)
-    assert detector.prev_pos == (0.11, 0.11)
+    np.testing.assert_array_equal(detector.prev_pos, np.array([0.11, 0.11]))
 
-    # Significant change (should trigger dummy turn)
-    assert detector.update(current_pos=(0.2, 0.2), dt=0.033)
-    assert detector.prev_pos == (0.2, 0.2)
+    # Real Turn Simulation
+    detector.reset() # Reset state
+    detector.update((0.0, 0.0), 0.033) # Init
+    
+    # Move Right (Speed ~ 3.0)
+    detector.update((0.1, 0.0), 0.033) 
+    
+    # Turn Down (90 deg) and Slow Down (Dist 0.05 -> Speed ~ 1.5)
+    # Ratio = 1.5/3.0 = 0.5 < 0.8 (Thresh)
+    # Angle = 90 > 30 (Thresh)
+    assert detector.update((0.1, 0.05), 0.033) is True
 
     detector.reset()
     assert detector.prev_pos is None
-    assert detector.state == "IDLE"
 
 # --- Test get_ref_hl_2d_points_mp ---
 def test_get_ref_hl_2d_points_mp_valid_input(dummy_skeleton_points_both_hands_up):
     # Using a fixture that has valid wrist points
     result = get_ref_hl_2d_points_mp(dummy_skeleton_points_both_hands_up)
     assert len(result) == 2
-    # Correct assertion: compare tuples
+    # Correct assertion: compare tuples using approx
     expected_left = (dummy_skeleton_points_both_hands_up[15].x, dummy_skeleton_points_both_hands_up[15].y)
     expected_right = (dummy_skeleton_points_both_hands_up[16].x, dummy_skeleton_points_both_hands_up[16].y)
-    assert result[0] == expected_left
-    assert result[1] == expected_right
+    
+    # Check Left Wrist
+    assert result[0][0] == pytest.approx(expected_left[0], abs=1e-3)
+    assert result[0][1] == pytest.approx(expected_left[1], abs=1e-3)
+    # Check Right Wrist
+    assert result[1][0] == pytest.approx(expected_right[0], abs=1e-3)
+    assert result[1][1] == pytest.approx(expected_right[1], abs=1e-3)
 
 def test_get_ref_hl_2d_points_mp_empty_input():
     result = get_ref_hl_2d_points_mp([])

@@ -96,8 +96,6 @@ def process_video_stream(
                 # 1. Optical Flow Calculation
                 curr_gray = cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2GRAY)
                 avg_motion = 0.0
-                if prev_gray is not None:
-                    avg_motion = calculate_optical_flow_value(prev_gray, curr_gray)
                 
                 # AI Inference
                 current_skeleton = pose_estimator.process_frame(frame_image_rgb)
@@ -117,6 +115,11 @@ def process_video_stream(
                 is_turn_detected = False
                 
                 if hand_status != 0:
+                    # Update Optical Flow only when hand is detected (Match C++ behavior)
+                    if prev_gray is not None:
+                        avg_motion = calculate_optical_flow_value(prev_gray, curr_gray)
+                    prev_gray = curr_gray # Update reference frame only if hand status is valid
+
                     # 3. Hand Turn Detection
                     if len(current_skeleton) > 16: # Ensure wrist landmarks exist
                         right_wrist = (current_skeleton[16].x, current_skeleton[16].y)
@@ -137,26 +140,18 @@ def process_video_stream(
                 
                 should_send_keyframe = False
 
-                # 4. Final Send Condition: Turn happened + Motion Stabilized + Not Frozen
-                if speak_start_flag and avg_motion < OPTICAL_FLOW_THRESH and frozen_flag == 0:
+                # 4. Final Send Condition: Turn happened + Motion Stabilized + Not Frozen + Not Currently Turning
+                if speak_start_flag and avg_motion < OPTICAL_FLOW_THRESH and frozen_flag == 0 and hand_status != 0 and not is_turn_detected:
                     should_send_keyframe = True
-                    # Reset/Set flags
-                    # In MFC, speakstartflag seems to persist until next logic or simple trigger? 
-                    # Assuming we reset it after successful send to wait for next turn.
-                    # Or does MFC allow multiple stops per turn? The snippet says "Holdcnt++", "writer->Write".
-                    # Usually we consume the flag.
-                    # speak_start_flag = False # Depending on desired behavior. Let's consume it.
-                    # Actually, if we consume it, we miss subsequent stops if the hand moves again without turning.
-                    # But 'HandTurnDetector' is the trigger.
-                    # Let's keep it simple: Consume flag to avoid continuous sending on static hand.
-                    speak_start_flag = False 
+                    # C++ does NOT reset speak_start_flag here. It persists until manually reset or session end.
+                    # speak_start_flag = False 
                     frozen_flag = OPTICAL_FLOW_HOLD_FRAME
 
                 # Decrement frozen flag
                 if frozen_flag > 0:
                     frozen_flag -= 1
                 
-                prev_gray = curr_gray # Update for next frame
+                # prev_gray update moved inside hand_status check to match C++
 
                 # Visualization (Pop window update)
                 try:
