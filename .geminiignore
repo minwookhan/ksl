@@ -1,5 +1,9 @@
 prompt_notes/
 org_notes/
+repomix_md/
+img_keyFrame/
+aider_config/
+ksl-cli/server/
 *.org
 *.task
 .env

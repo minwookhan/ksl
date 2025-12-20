@@ -60,6 +60,7 @@ def process_video_stream(
     speak_start_flag = False
     frozen_flag = 0
     saved_keyframe_count = 0
+    detected_keyframes: List[int] = []
 
     try:
         logger.info(f"Starting video processing for session: {session_id}")
@@ -74,7 +75,7 @@ def process_video_stream(
                 logger.error(f"Failed to open output file: {e}")
 
         def frame_generator() -> Iterator[pb2.Frame]:
-            nonlocal frame_count, prev_skeleton, current_motion_status, prev_gray, speak_start_flag, frozen_flag, saved_keyframe_count # For updating outer scope variables
+            nonlocal frame_count, prev_skeleton, current_motion_status, prev_gray, speak_start_flag, frozen_flag, saved_keyframe_count, detected_keyframes # For updating outer scope variables
             
             for frame_image_rgb in video_loader.get_frames():
                 frame_count += 1
@@ -146,6 +147,7 @@ def process_video_stream(
                     # C++ does NOT reset speak_start_flag here. It persists until manually reset or session end.
                     # speak_start_flag = False 
                     frozen_flag = OPTICAL_FLOW_HOLD_FRAME
+                    detected_keyframes.append(frame_count)
 
                 # Decrement frozen flag
                 if frozen_flag > 0:
@@ -248,6 +250,7 @@ def process_video_stream(
             logger.info("Closed output file.")
         grpc_client.close()
         logger.info(f"Finished processing for session: {session_id}. Total frames: {frame_count}")
+        logger.info(f"Detected Keyframes: {detected_keyframes}")
         if config.save_keyframes_only:
             logger.info(f"Total extracted keyframes: {saved_keyframe_count}")
 

@@ -1,9 +1,8 @@
 import numpy as np
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
+import cv2
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
+from src.mp_detect import mediapipe_pose_func, mediapipe_hand_func
 
 @dataclass(frozen=True)
 class SkeletonPoint:
@@ -19,15 +18,8 @@ class SkeletonPoint:
 class MediaPipePoseEstimator:
     def __init__(self, model_path: str):
         self.model_path = model_path
-        self.base_options = python.BaseOptions(model_asset_path=self.model_path)
-        self.options = vision.PoseLandmarkerOptions(base_options=self.base_options,
-                                                    output_segmentation_masks=False)
-        self.landmarker: Optional[vision.PoseLandmarker] = None
-        self._initialize_landmarker()
-
-    def _initialize_landmarker(self):
-        """MediaPipe PoseLandmarker를 초기화합니다."""
-        self.landmarker = vision.PoseLandmarker.create_from_options(self.options)
+        # Note: model_path is kept for interface compatibility but not used by mp_detect
+        pass
 
     def process_frame(self, image_np: np.ndarray) -> List[SkeletonPoint]:
         """
@@ -35,31 +27,46 @@ class MediaPipePoseEstimator:
         Input: image_np (np.ndarray, RGB)
         Output: List[SkeletonPoint] (2D/3D Pose Landmarker Results)
         """
-        if self.landmarker is None:
-            raise RuntimeError("MediaPipe PoseLandmarker not initialized.")
-
-        # numpy array -> MediaPipe Image
-        # MediaPipe expects RGB image_format
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_np)
+        # mp_detect.mediapipe_pose_func expects BGR image (it converts BGR->RGB internally)
+        # So we convert our RGB input to BGR first.
+        image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
         
-        # 추론 수행
-        detection_result = self.landmarker.detect(mp_image)
+        # Returns np.array([all_x, all_y, all_z, all_vis])
+        result_array = mediapipe_pose_func(image_bgr)
         
-        # 결과 파싱
-        return self._parse_landmarks(detection_result)
-
-    def _parse_landmarks(self, result: vision.PoseLandmarkerResult) -> List[SkeletonPoint]:
-        """
-        MediaPipe 추론 결과를 SkeletonPoint 리스트로 파싱합니다.
-        """
         all_landmarks: List[SkeletonPoint] = []
-        if result.pose_landmarks:
-            # 단일 인물 가정 (첫 번째 인물의 랜드마크만 사용)
-            for landmark in result.pose_landmarks[0]:
+        
+        # Check if we have valid results (shape should be (4, N) where N > 0)
+        if result_array.ndim == 2 and result_array.shape[0] == 4 and result_array.shape[1] > 0:
+            xs = result_array[0]
+            ys = result_array[1]
+            zs = result_array[2]
+            vis = result_array[3]
+            
+            for i in range(len(xs)):
                 all_landmarks.append(SkeletonPoint(
-                    x=landmark.x,
-                    y=landmark.y,
-                    z=landmark.z,
-                    visibility=getattr(landmark, 'visibility', None) # visibility는 없을 수도 있음
+                    x=float(xs[i]),
+                    y=float(ys[i]),
+                    z=float(zs[i]),
+                    visibility=float(vis[i])
                 ))
+
+        # Add Hand Landmarks
+        # Returns np.array([all_x, all_y, all_z, all_side])
+        hand_result_array = mediapipe_hand_func(image_bgr)
+
+        if hand_result_array.ndim == 2 and hand_result_array.shape[0] == 4 and hand_result_array.shape[1] > 0:
+            xs = hand_result_array[0]
+            ys = hand_result_array[1]
+            zs = hand_result_array[2]
+            sides = hand_result_array[3] # 1.0 for Right, 0.0 for Left
+
+            for i in range(len(xs)):
+                all_landmarks.append(SkeletonPoint(
+                    x=float(xs[i]),
+                    y=float(ys[i]),
+                    z=float(zs[i]),
+                    visibility=float(sides[i]) 
+                ))
+                
         return all_landmarks

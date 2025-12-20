@@ -433,6 +433,110 @@ pDlg->m_sgcp_vtSkeletonMP.push_back(
 
 - *데이터 구조:* Python 함수는 =N x 3= (Point list)가 아니라 *=3 x N= (Dimension list)* 형태의 데이터를 반환하는 것으로 보입니다. 이를 C++ 루프에서 =Point3f= 구조체 배열(=AoS=)로 재조립합니다.
 
+* 데이터 흐름 분석-3
+=mfc_client_src= 내의 코드(=gRPCThread_.h=의 =SequenceClient::SendFrames=, =gRPCFileClientDlg.cpp=, =HandTurnDetector.hpp= 등)를 분석하여, *하나의 프레임 이미지*가 입력되었을 때 *KeyFrame(전송할 유의미한 프레임)으로 결정되는 과정*을 체계적으로 설명합니다.
+
+이 프로세스는 크게 *입력 및 전처리*, *AI 골격 추출*, *모션 분석(Optical Flow)*, *손 궤적 분석(Turn Detection)*, *최종 결정*의 5단계로 진행됩니다.
+
+--------------
+
+*** 1. 입력 및 전처리 (Preprocessing)
+비디오나 카메라로부터 한 장의 이미지를 획득하고 분석 대상 영역(ROI)을 설정하는 단계입니다.
+
+- *함수 위치*: =gRPCThread_.h= -> =SequenceClient::SendFrames=
+- *입력*:
+  - =cv::Mat img=: 원본 프레임 (예: 1920x1080, BGR, =CV_8UC3=)
+  - =cv::Rect m_roi=: 사용자가 설정한 관심 영역
+- *처리*:
+  - =img=에서 =m_roi= 영역을 잘라내어(=roi=) =pDlg->m_cap_img=에 저장합니다.
+  - ROI의 너비가 320px 이상이면 320px 기준으로 리사이즈(축소)합니다.
+- *출력*:
+  - =pDlg->m_cap_img=: 분석용 이미지 (예: 320xN, BGR, =CV_8UC3=)
+
+*** 2. AI 골격 추출 (Pose Estimation)
+MediaPipe를 이용해 인체 랜드마크(스켈레톤)를 추출합니다.
+
+- *함수 위치*: =gRPCFileClientDlg.cpp= -> =AIThread= (Python 임베딩 호출)
+- *입력*:
+  - =pDlg->m_cap_img=: 전처리된 이미지
+- *처리*:
+  - Python =ACR.mp_detect.mediapipe_pose_func= 호출.
+  - MediaPipe Pose 솔루션을 수행하여 33개의 3D 랜드마크 좌표를 얻습니다.
+- *출력 (주요 변수)*:
+  - =pDlg->m_sgcp_vtSkeletonMP=: =std::vector<cv::Point3f>=
+    - *크기*: 33 (Pose Landmarks 개수)
+    - *값*: 0.0 ~ 1.0 사이의 정규화된 좌표 (x, y, z)
+    - /예: 손목 좌표(인덱스 15, 16)가 (0.45, 0.62, -0.1) 형태로 저장됨./
+
+*** 3. 모션 강도 분석 (Optical Flow)
+프레임 간의 픽셀 변화량을 계산하여 움직임이 멈추었는지(정지 동작) 판단합니다.
+
+- *함수 위치*: =gRPCFileClientDlg.cpp= -> =GetMotionVauleWithOpticalFlow=
+- *입력*:
+  - =cv::Mat roi=: 현재 프레임의 ROI 이미지
+  - =static cv::Mat prev=: 이전 프레임 이미지
+- *처리*:
+  - =calcOpticalFlowPyrLK=를 사용하여 특징점들의 이동 벡터를 계산.
+  - 이동 벡터들의 평균 길이(Euclidean distance)를 산출.
+- *출력*:
+  - =avgMotion=: =double=
+    - *값*: 평균 픽셀 이동량 (예: 0.1 ~ 20.0)
+    - /값이 작을수록(=OPTICALFLOW_THRESH= 미만) 동작이 멈춘 상태임을 의미./
+
+*** 4. 손 궤적 방향 전환 감지 (Hand Turn Detection)
+손이 움직이다가 방향을 급격히 바꾸는 지점(변곡점)을 감지합니다. 수어 동작의 시작이나 끝을 알리는 신호로 사용됩니다.
+
+- *함수 위치*: =HandTurnDetector.hpp= -> =HandTurnDetector::update=
+- *입력*:
+  - =pos=: 손목 좌표 =cv::Point2f(x, y)= (정규화된 좌표, =m_sgcp_vtSkeletonMP=에서 가져옴)
+  - =dt=: 프레임 간 시간 간격 =double= (예: 0.033 sec)
+- *처리*:
+  - 현재 속도 벡터와 이전 속도 벡터의 *각도 변화(=dtheta=)* 및 *속도 감소 비율(=ratio=)* 계산.
+  - *조건*: 각도 변화 > 30도 (=angleRadTh_=) *AND* 속도 20% 이상 감소 (=speedRatioTh_ = 0.8=).
+- *출력*:
+  - =bool detected=:
+    - =true=: 방향 전환 발생 (유효한 코너)
+    - =false=: 일반적인 이동
+
+*** 5. 최종 KeyFrame 결정 (Decision Logic)
+위의 정보들을 종합하여 현재 프레임을 서버로 전송할지 결정합니다.
+
+- *함수 위치*: =gRPCThread_.h= -> =SequenceClient::SendFrames= 내부 루프
+- *판단 로직 (AND 조건)*:
+  1. *손 상태 유효*: =hand_status != 0= (손이 인식됨)
+  2. *동작 시작됨 (=speakstartflag=)*: 이전에 =HandTurnDetector=에 의해 손의 방향 전환이 한 번이라도 감지되어 =speakstartflag=가 1로 세트되어야 함.
+  3. *정지 상태 (=avgMotion=)*: =avgMotion < OPTICALFLOW_THRESH= (0.45). 손이 움직이다가 멈춘 순간(KeyFrame 후보).
+  4. *중복 방지 (=frozenflag=)*: =frozenflag == 0=. 최근에 프레임을 전송한 적이 없어야 함.
+- *결과*:
+  - 조건 만족 시:
+    - =writer->Write(frame)=: 현재 프레임과 스켈레톤 정보를 gRPC로 전송.
+    - =frozenflag = OPTICAL_FLOW_HOLD_FRAME= (3): 향후 3프레임 동안 전송 금지.
+  - 조건 불만족 시:
+    - 프레임 스킵 (전송하지 않음).
+
+--------------
+
+*** 요약 다이어그램
+#+begin_src mermaid
+graph TD
+    A[입력 이미지 (Frame)] --> B[전처리 (Resize & ROI)]
+    B --> C[AI Inference (MediaPipe)]
+    C -->|Skeleton (33pts)| D{손 상태/위치 확인}
+
+    B --> E[Optical Flow 계산]
+    E -->|avgMotion| F{움직임 멈춤?}
+
+    C --> G[HandTurnDetector]
+    G -->|True/False| H{방향 전환(Turn) 감지?}
+
+    H -- Yes --> I[SpeakStartFlag = 1]
+
+    D --> J{최종 판단}
+    F -- Yes (< 0.45) --> J
+    I -- Yes --> J
+    J -- 조건 만족 (Turn 후 멈춤) --> K[KeyFrame 전송 (gRPC Write)]
+#+end_src
+
 * AIThread
 ** gemini-web
 `AIThread`는 메인 로직(비디오 재생 또는 gRPC 전송 스레드)으로부터 영상 데이터가 준비되었다는 신호를 받으면, 내장된 Python 인터프리터를 통해 MediaPipe 로직을 수행하고 결과를 C++ 구조체에 저장합니다.
@@ -1771,3 +1875,155 @@ m_sgcp_vtSkeletonMP에 저장된 스켈레톤 데이터는 AIThread가 완료 �
 결론
 
 C++ 클라이언트가 Python ACR.mp_detect로부터 받는 데이터는 "일반적인 MediaPipe Pose 추측 결과 데이터"의 직접적인 원본 객체가 아니라, 이미 C++에서 사용하기 편리한 =float= 리스트의 리스트 형태로 정제되고, 랜드마크의 개수도 =손(21개)=에 특화된 형태일 가능성이 매우 높습니다. visibility 같은 부가 정보는 이 변환 과정에서 손실되거나 사용되지 않았을 것입니다.
+* pybind로 주고받는 데이터 형식
+=mfc_client_src/gRPCFileClientDlg.h= 와 =mfc_client_src/ACR/mp_detect.py= 를 분석한 결과, C++(MFC)와 Python(MediaPipe) 간의 데이터 교환 방식은 다음과 같습니다.
+*** 1. C++ → Python (입력)
+C++에서 OpenCV =cv::Mat= 객체를 Python 함수로 전달합니다. =gRPCFileClientDlg.h=에 정의된 =pybind11::detail::type_caster<cv::Mat>=를 통해 자동 변환됩니다.
+
+- *C++ 측*: =cv::Mat dst_img= (BGR 이미지)
+- *전달 방식*: =pybind11::cast(dst_img)=
+- *Python 측*: =numpy.ndarray= (Shape: =[Height, Width, 3]=, dtype: =uint8=)
+
+*** 2. Python → C++ (출력)
+Python 함수 =mediapipe_pose_func= 및 =mediapipe_hand_func=는 분석 결과(랜드마크 좌표)를 =numpy.ndarray= 형태로 반환하며, 이를 C++에서 =std::vector<std::vector<double>>=로 변환하여 받습니다.
+
+- *Python 측 반환값*: =numpy.ndarray= (dtype: =float32= 또는 =float64=)
+  - *형태 (Shape)*: =(4, N)= (N=랜드마크 개수, Pose는 33개, Hand는 가변적)
+  - *구성*:
+    - Row 0: =all_x= (X 좌표 목록)
+    - Row 1: =all_y= (Y 좌표 목록)
+    - Row 2: =all_z= (Z 좌표 목록)
+    - Row 3: =all_vis= (Visibility 또는 Hand Side 정보)
+- *C++ 측 수신*:
+  - =auto mp_result = result_pose_mp.cast<std::vector<std::vector<double>>>();=
+  - 이후 =mp_result[0][k]=, =mp_result[1][k]=, =mp_result[2][k]=를 사용하여 =cv::Point3f= 객체로 재구성합니다.
+
+*** 요약 표
+| 방향          | 데이터 내용  | C++ 타입                          | Python 타입    | 비고                             |
+|--------------+------------+----------------------------------+---------------+---------------------------------|
+| *C++ → Python* | 입력 이미지  | =cv::Mat=                          | =numpy.ndarray= | #ERROR                          |
+| *Python → C++* | 랜드마크 좌표 | =std::vector<std::vector<double>>= | =numpy.ndarray= | X, Y, Z, Visibility 순서로 행 구성 |
+#+TB      LFM: $5=type_caster=로 자동 변환 (BGR)
+* md_detect.py
+** hand의 결과파일 landmark   자료구조
+  [[id:a24739a8-75dd-4e12-8ff0-20acec42f719][landmark_자료구조]]
+=mediapipe_hand_func()= 및 =mediapipe_pose_func()= 함수에 대한 상세 설명입니다.
+--------------
+*** =mediapipe_hand_func(img)= 함수
+이 함수는 MediaPipe Hands 솔루션을 사용하여 입력 이미지에서 손 랜드마크를 감지하고, 그 정보를 정규화된 좌표 형태로 반환합니다.
+
+*1. 초기화 (=mp_hands.Hands= 객체):*
+
+- =mp_hands = mp.solutions.hands=: MediaPipe Hands 모듈을 불러옵니다.
+- =hands_image = mp_hands.Hands(...)=: 손 감지 모델을 초기화합니다.
+  - =static_image_mode=True=: 이 설정은 비디오 스트림이 아닌 단일 이미지에 대해 모델을 실행하도록 지시합니다. 모델은 각 이미지에서 손을 독립적으로 감지하므로, 추적 오버헤드가 없습니다.
+  - =max_num_hands=2=: 감지할 수 있는 최대 손의 수를 2개로 설정합니다.
+  - =model_complexity=1=: 랜드마크 모델의 복잡도를 설정합니다. 0은 경량 모델, 1은 기본 모델입니다. 숫자가 높을수록 정확도는 높아지지만 처리 속도는 느려집니다.
+  - =min_detection_confidence=0.5=: 손 감지 모델의 최소 신뢰도 임계값을 0.5로 설정합니다. 이 값보다 낮은 신뢰도를 가진 감지는 무시됩니다.
+
+*2. 입력 처리 및 색상 변환:*
+
+- =rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if (img.ndim == 3 and img.shape[2] == 3) else img=:
+  - 함수는 =BGR= 이미지를 입력으로 받도록 설계되어 있습니다.
+  - 만약 입력 =img=가 3채널(높이 x 너비 x 3) BGR 이미지라면, =cv2.cvtColor()=를 사용하여 =RGB= 형식으로 변환합니다.
+  - 이미 =RGB= 형식으로 제공되었거나 다른 형식이라면 그대로 사용합니다. MediaPipe 모델은 =RGB= 이미지를 기대합니다.
+
+*3. 손 랜드마크 감지:*
+
+- =results = hands_image.process(rgb)=: 초기화된 =hands_image= 모델의 =process()= 메서드를 사용하여 =RGB= 이미지에서 손 랜드마크를 감지합니다. 이 =results= 객체에는 감지된 손의 랜드마크(=multi_hand_landmarks=) 및 각 손의 방향 정보(=multi_handedness=)가 포함됩니다.
+
+*4. 랜드마크 정보 추출 및 정렬:*
+
+- =all_x, all_y, all_z, all_side = [], [], [], []=: 감지된 손 랜드마크의 x, y, z 좌표와 손의 방향(오른손/왼손)을 저장할 리스트를 초기화합니다.
+- =if results.multi_hand_landmarks:=: 손 랜드마크가 감지된 경우에만 다음 로직을 실행합니다.
+- =packs= 리스트에 각 손의 방향(=side=), 신뢰도(=score=), 랜드마크 목록(=hlm.landmark=)을 튜플 형태로 저장합니다. =multi_handedness=를 통해 손의 방향(예: "Right", "Left")과 해당 감지의 신뢰도를 가져옵니다.
+- =priority = {"Right": 1, "Left": 0}=: 손 정렬을 위한 우선순위 딕셔너리를 정의합니다. 'Right' 손이 'Left' 손보다 우선순위가 높습니다.
+- =packs.sort(key=lambda t: (priority.get(t[0], 2), -t[1]))=: 감지된 손들을 정렬합니다.
+  - *주요 정렬 기준:* =priority.get(t[0], 2)=를 사용하여 'Right' 손을 먼저, 그 다음 'Left' 손을 정렬합니다. 알 수 없는 손은 가장 뒤로 갑니다.
+  - *보조 정렬 기준:* =-t[1]=을 사용하여 같은 종류의 손(예: 모두 'Right' 손) 내에서는 신뢰도 점수(=score=)가 높은 순서대로 정렬합니다. 이 정렬은 출력 순서의 일관성을 보장합니다.
+- 정렬된 =packs= 리스트를 순회하며 각 손의 21개 랜드마크에 대해 x, y, z 좌표를 =all_x=, =all_y=, =all_z= 리스트에 추가합니다.
+- =all_side= 리스트에는 'Right' 손인 경우 =1.0=, 'Left' 손인 경우 =0.0=을 추가하여 손의 방향 정보를 인코딩합니다.
+
+*5. 반환 값:*
+
+- =return np.array([all_x, all_y, all_z, all_side], dtype=np.float32)=: 수집된 모든 x, y, z 좌표와 손의 방향 정보를 NumPy 배열로 변환하여 반환합니다. 이 배열은 각 손 랜드마크의 정규화된 3D 좌표 (0~1 범위)와 해당 랜드마크가 어느 손에 속하는지 나타내는 정보를 포함합니다. (예: =[x_coords], [y_coords], [z_coords], [side_info]=)
+
+--------------
+
+*** =mediapipe_pose_func(img)= 함수
+이 함수는 MediaPipe Pose 솔루션을 사용하여 입력 이미지에서 인체 포즈 랜드마크를 감지하고, 그 정보를 정규화된 좌표와 가시성 형태로 반환합니다.
+
+*1. 초기화 (=mp_pose.Pose= 객체):*
+
+- =mp_pose = mp.solutions.pose=: MediaPipe Pose 모듈을 불러옵니다.
+- =pose = mp_pose.Pose(...)=: 포즈 감지 모델을 초기화합니다.
+  - =static_image_mode=False=: 이 설정은 원래 비디오 스트림에서 객체 추적을 활성화하지만, 현재 함수 내에서는 단일 이미지에 대해 =process()=를 호출하고 있으므로 실제 추적 이점은 활용되지 않습니다. 모델은 각 이미지에서 포즈를 독립적으로 감지합니다.
+  - =model_complexity=1=: 랜드마크 모델의 복잡도를 설정합니다 (0: 경량, 1: 기본, 2: 풀 모델).
+
+*2. 입력 처리 및 색상 변환:*
+
+- =rgb_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)=: 입력 =img=가 BGR 이미지로 간주되므로, =cv2.cvtColor()=를 사용하여 =RGB= 형식으로 변환합니다. MediaPipe 모델은 =RGB= 이미지를 기대합니다.
+
+*3. 포즈 랜드마크 감지:*
+
+- =results = pose.process(rgb_frame)=: 초기화된 =pose= 모델의 =process()= 메서드를 사용하여 =RGB= 이미지에서 포즈 랜드마크를 감지합니다. 이 =results= 객체에는 감지된 포즈 랜드마크(=pose_landmarks=)가 포함됩니다.
+
+*4. 랜드마크 정보 추출:*
+
+- =all_x, all_y, all_z, all_vis = [], [], [], []=: 감지된 포즈 랜드마크의 x, y, z 좌표와 가시성(visibility)을 저장할 리스트를 초기화합니다.
+- =if results.pose_landmarks:=: 포즈 랜드마크가 감지된 경우에만 다음 로직을 실행합니다.
+- =for lm in results.pose_landmarks.landmark:=: 감지된 모든 포즈 랜드마크(=results.pose_landmarks.landmark=)를 순회합니다.
+  - 각 랜드마크(=lm=)에서 정규화된 x, y, z 좌표와 =visibility= (랜드마크가 이미지에 얼마나 잘 보이는지 나타내는 값, 0.0에서 1.0 사이)를 추출하여 해당 리스트에 추가합니다.
+
+*5. 반환 값:*
+
+- =return np.array([all_x, all_y, all_z, all_vis])=: 수집된 모든 x, y, z 좌표와 가시성 정보를 NumPy 배열로 변환하여 반환합니다. 이 배열은 각 포즈 랜드마크의 정규화된 3D 좌표 (0~1 범위)와 해당 랜드마크의 가시성 정보를 포함합니다.
+*
+
+ [[id:527735bd-c383-4786-8a6a-14bf471964ca][landmark_자료구조이해]]
+** pose 의 결과파일 landmark 자료구조
+ *** 요약
+ - 33개의 항목에 대한 (x,y,z,visibility) 으로 구성.
+ - 33개 항목  세부내용
+   [[id:84040e98-d126-4eae-b776-737b0b4e9415][pose landmark 요소]]
+MediaPipe Pose 랜드마크의 세부 자료형과 예제 숫자는 다음과 같습니다.
+
+*** 랜드마크 세부 자료형
+=mediapipe_pose_func= 함수에서 =results.pose_landmarks.landmark=를 통해 접근하는 각 =lm= (랜드마크) 객체의 속성들은 다음과 같은 자료형을 가집니다:
+
+- =lm.x=  : =float= (부동 소수점 숫자)
+- =lm.y= : =float= (부동 소수점 숫자)
+- =lm.z= : =float= (부동 소수점 숫자)
+- =lm.visibility= : =float= (부동 소수점 숫자)
+
+결과적으로 이들을 모아 =np.array=로 반환할 때 =dtype=를 따로 지정하지 않았으므로, NumPy는 내부적으로 가장 적절한 부동 소수점 타입을 선택합니다. (일반적으로 =float64=가 될 수 있습니다, 하지만 MediaPipe 자체는 =float=를 반환합니다.)
+
+*** 예제 숫자
+랜드마크 값들은 이미지의 너비와 높이에 대해 *0.0에서 1.0 사이로 정규화된 값*입니다. =z= 값은 상대적인 깊이를 나타내며 음수 또는 양수 값을 가질 수 있습니다. =visibility= 또한 0.0에서 1.0 사이의 값으로 표현됩니다.
+
+예를 들어, 한 랜드마크(예: 코)에 대한 값은 다음과 같을 수 있습니다:
+
+#+begin_example
+lm = {
+    'x': 0.485,        # 이미지 너비의 48.5% 지점 (중앙에 가까움)
+    'y': 0.210,        # 이미지 높이의 21.0% 지점 (상단에 가까움)
+    'z': -0.052,       # 상대적인 깊이. (코는 어깨보다 몸 밖으로 나와있는 경향이 있어 음수값을 가질 수 있습니다)
+    'visibility': 0.98 # 매우 잘 보이는 랜드마크
+}
+#+end_example
+
+*전체 =np.array= 반환 형태 예시 (단순화된 3개 랜드마크 가정):*
+
+실제로는 33개의 랜드마크가 있지만, 이해를 돕기 위해 3개의 랜드마크만 있다고 가정하고 =mediapipe_pose_func=의 반환 형태를 보면:
+
+#+begin_src python
+# 예를 들어, 코, 왼쪽 어깨, 오른쪽 어깨 랜드마크가 감지되었다고 가정
+[
+    [0.485, 0.350, 0.620],  # all_x: 각 랜드마크의 x 좌표
+    [0.210, 0.400, 0.410],  # all_y: 각 랜드마크의 y 좌표
+    [-0.052, 0.120, 0.150], # all_z: 각 랜드마크의 z 좌표
+    [0.980, 0.950, 0.960]   # all_vis: 각 랜드마크의 가시성
+]
+#+end_src
+
+여기서 각 내부 리스트는 NumPy 배열의 한 행이 되며, 각 열은 해당 랜드마크의 특정 속성(x, y, z, visibility) 값을 나타냅니다.
