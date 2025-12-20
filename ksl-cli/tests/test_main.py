@@ -37,6 +37,9 @@ def test_process_video_stream(mock_encode_frame, MockHandTurnDetector):
     mock_config.frame_range = None
     mock_config.save_keyframes_only = False
     mock_config.output_path = None
+    mock_config.log_level = logging.INFO
+    mock_config.no_gui = False
+    mock_config.debug_file = False
 
     mock_video_loader = MagicMock()
     dummy_frame = np.zeros((240, 320, 3), dtype=np.uint8)

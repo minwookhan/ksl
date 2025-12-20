@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Iterator, List, Optional
 import cv2
+import csv
+import numpy as np
 
 # Ensure src path is available for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -74,8 +76,26 @@ def process_video_stream(
             except OSError as e:
                 logger.error(f"Failed to open output file: {e}")
 
+        # Prepare debug CSV file if enabled
+        debug_csv_file = None
+        debug_csv_writer = None
+        if config.debug_file:
+            try:
+                start_f = config.frame_range[0] if config.frame_range else 0
+                end_f = config.frame_range[1] if config.frame_range else "end"
+                # Construct filename: video_filename_start_end.csv
+                video_name = config.video_path.name
+                csv_filename = f"{video_name}_{start_f}_{end_f}.csv"
+                
+                debug_csv_file = open(csv_filename, 'w', newline='')
+                debug_csv_writer = csv.writer(debug_csv_file)
+                debug_csv_writer.writerow(['frame_index', 'avg_motion', 'Rdev', 'Ldev'])
+                logger.info(f"Saving debug info to {csv_filename}")
+            except OSError as e:
+                logger.error(f"Failed to open debug CSV file: {e}")
+
         def frame_generator() -> Iterator[pb2.Frame]:
-            nonlocal frame_count, prev_skeleton, current_motion_status, prev_gray, speak_start_flag, frozen_flag, saved_keyframe_count, detected_keyframes # For updating outer scope variables
+            nonlocal frame_count, prev_skeleton, current_motion_status, prev_gray, speak_start_flag, frozen_flag, saved_keyframe_count, detected_keyframes, debug_csv_writer # For updating outer scope variables
             
             for frame_image_rgb in video_loader.get_frames():
                 frame_count += 1
@@ -100,6 +120,23 @@ def process_video_stream(
                 
                 # AI Inference
                 current_skeleton = pose_estimator.process_frame(frame_image_rgb)
+
+                # Calculate Rdev/Ldev for debug
+                r_dev = 0.0
+                l_dev = 0.0
+                if config.debug_file and prev_skeleton and current_skeleton and len(prev_skeleton) > 16 and len(current_skeleton) > 16:
+                     right_wrist_idx = 16
+                     left_wrist_idx = 15
+                     prev_R = np.array([prev_skeleton[right_wrist_idx].x, prev_skeleton[right_wrist_idx].y])
+                     cur_R = np.array([current_skeleton[right_wrist_idx].x, current_skeleton[right_wrist_idx].y])
+                     r_dev = float(np.linalg.norm(cur_R - prev_R))
+                     
+                     prev_L = np.array([prev_skeleton[left_wrist_idx].x, prev_skeleton[left_wrist_idx].y])
+                     cur_L = np.array([current_skeleton[left_wrist_idx].x, current_skeleton[left_wrist_idx].y])
+                     l_dev = float(np.linalg.norm(cur_L - prev_L))
+
+                if debug_csv_writer:
+                    debug_csv_writer.writerow([frame_count, avg_motion, r_dev, l_dev])
 
                 # Business Logic & State Management
                 # Update motion status
@@ -156,23 +193,24 @@ def process_video_stream(
                 # prev_gray update moved inside hand_status check to match C++
 
                 # Visualization (Pop window update)
-                try:
-                    # Convert RGB (from VideoLoader) to BGR (for OpenCV Display)
-                    vis_img = cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2BGR)
+                if not config.no_gui:
+                    try:
+                        # Convert RGB (from VideoLoader) to BGR (for OpenCV Display)
+                        vis_img = cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2BGR)
 
-                    if should_send_keyframe:
-                        # Highlight Keyframe
-                        cv2.putText(vis_img, "KEYFRAME DETECTED", (20, 50), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-                        cv2.rectangle(vis_img, (0, 0), (vis_img.shape[1]-1, vis_img.shape[0]-1), (0, 0, 255), 4)
-                        logger.info(f"Frame {frame_count}: Sending KEYFRAME (AvgMotion: {avg_motion:.2f})")
-                    
-                    cv2.imshow("KSL Client Stream", vis_img)
-                    # Process GUI events (1ms delay)
-                    if cv2.waitKey(1) & 0xFF == 27: # ESC to stop strictly if needed
-                        pass 
-                except Exception as e:
-                    logger.debug(f"Visualization error (headless?): {e}")
+                        if should_send_keyframe:
+                            # Highlight Keyframe
+                            cv2.putText(vis_img, "KEYFRAME DETECTED", (20, 50), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                            cv2.rectangle(vis_img, (0, 0), (vis_img.shape[1]-1, vis_img.shape[0]-1), (0, 0, 255), 4)
+                            logger.info(f"Frame {frame_count}: Sending KEYFRAME (AvgMotion: {avg_motion:.2f})")
+                        
+                        cv2.imshow("KSL Client Stream", vis_img)
+                        # Process GUI events (1ms delay)
+                        if cv2.waitKey(1) & 0xFF == 27: # ESC to stop strictly if needed
+                            pass 
+                    except Exception as e:
+                        logger.debug(f"Visualization error (headless?): {e}")
 
                 # Encode to Protobuf Frame
                 # Only send if it is a keyframe
@@ -225,7 +263,10 @@ def process_video_stream(
                 
                 response_iterator = grpc_client.send_stream(gen)
                 for response in response_iterator:
-                    logger.info(f"Server response: {response.message}")
+                    if config.log_level > logging.CRITICAL:
+                        print(f"Server response: {response.message}")
+                    else:
+                        logger.info(f"Server response: {response.message}")
 
             except Exception as e:
                 logger.warning(f"gRPC connection/streaming failed: {e}")
@@ -244,15 +285,23 @@ def process_video_stream(
         logger.exception(f"An unexpected error occurred during processing: {e}")
         sys.exit(1)
     finally:
-        cv2.destroyAllWindows()
+        if 'debug_csv_file' in locals() and debug_csv_file:
+            debug_csv_file.close()
+            logger.info("Closed debug CSV file.")
+        if not config.no_gui:
+            cv2.destroyAllWindows()
         if 'output_file' in locals() and output_file:
             output_file.close()
             logger.info("Closed output file.")
         grpc_client.close()
-        logger.info(f"Finished processing for session: {session_id}. Total frames: {frame_count}")
-        logger.info(f"Detected Keyframes: {detected_keyframes}")
-        if config.save_keyframes_only:
-            logger.info(f"Total extracted keyframes: {saved_keyframe_count}")
+        
+        if config.log_level > logging.CRITICAL:
+             print(f"Detected Keyframes Count: {len(detected_keyframes)}, Indices: {detected_keyframes}")
+        else:
+            logger.info(f"Finished processing for session: {session_id}. Total frames: {frame_count}")
+            logger.info(f"Detected Keyframes Count: {len(detected_keyframes)}, Indices: {detected_keyframes}")
+            if config.save_keyframes_only:
+                logger.info(f"Total extracted keyframes: {saved_keyframe_count}")
 
 
 def main():
@@ -275,13 +324,18 @@ def main():
     parser.add_argument("--keyframeOnly", type=int, choices=[0, 1], default=0,
                         help="If 1, extract and save KeyFrames to ./keyFrame folder without sending to gRPC.")
     parser.add_argument("--log-level", type=str, default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "NONE"],
                         help="Set the logging level (default: INFO)")
+    parser.add_argument("--no-gui", action="store_true", help="Disable video visualization (OpenCV imshow).")
+    parser.add_argument("--debugFile", action="store_true", help="Save debug information (motion values) to a CSV file.")
 
     args = parser.parse_args()
 
     # Setup logging based on argument
-    log_level_val = getattr(logging, args.log_level.upper())
+    if args.log_level.upper() == "NONE":
+        log_level_val = logging.CRITICAL + 1
+    else:
+        log_level_val = getattr(logging, args.log_level.upper())
     setup_logging(log_level_val)
 
     try:
@@ -295,7 +349,9 @@ def main():
             output_path=args.output,
             frame_range=tuple(args.frame) if args.frame else None,
             save_keyframes_only=bool(args.keyframeOnly),
-            log_level=log_level_val
+            log_level=log_level_val,
+            no_gui=args.no_gui,
+            debug_file=args.debugFile
         )
 
         # Initialize components

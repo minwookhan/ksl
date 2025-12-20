@@ -12,6 +12,8 @@ class AppConfig:
     frame_range: Optional[Tuple[int, int]] = None  # (start_frame, end_frame)
     save_keyframes_only: bool = False
     log_level: int = logging.INFO
+    no_gui: bool = False
+    debug_file: bool = False
     
     def __post_init__(self):
         """기본 유효성 검사"""
