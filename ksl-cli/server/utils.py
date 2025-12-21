@@ -4,6 +4,9 @@ import numpy as np
 def decode_frame(image_bytes: bytes, width: int, height: int, cv_type: int) -> np.ndarray:
     """
     Decodes raw image bytes into an OpenCV numpy array using width, height, and type.
+    Currently this function uses only OpenCV (cv2) for decoding raw bytes.
+    For video frame loading, the project primarily uses OpenCV's VideoCapture,
+    but other methods may be present elsewhere (e.g., in VideoLoader).
     """
     if width <= 0 or height <= 0 or len(image_bytes) == 0:
         return None
