@@ -1,3 +1,6 @@
+test_mp4s/
+aider_config/
+img_keyFrame/
 .DS_Store
 .idea
 *.log

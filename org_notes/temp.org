@@ -1,0 +1,20 @@
+* 비교 노트.
+#+begin_src mardkdown
+## Instruction
+1. mfc_client_src/ 와 ksl-cli/src/ 는 동일한 작업이다.
+2. mfc_client_src/ 를 python 으로 포팅한 것이 ksl-cli/ 이다.
+3. 파이썬 코드와 mfc  코드의 작업 동일성을 검증하고자 한다.
+4. mfc의 MFC  ui/ux 관련 함수는 무시하라.
+5. 프로그램 동작 개요는 {{Procedure}}와 같다.
+## Procedure
+1. 영상을 startFrame 에서 endFrame 까지 로딩한다.
+2. frame 을 startFrame 부터 roi영역으로 crap -> roi_img
+3. roi_img 를 이미지 전처리 한다. -> roi_img_send
+4. roi_img_send 를 python module mp_detect.py 를 이용해 판단한다.
+5. mp_detect 의 리턴값으로 KeyFrame 여부를 판단한다.
+## Question
+1. Procedure 순서데로 mfc 와  python은 동일 하게 동작하는가?
+2. {{Procedure}} 각 단계를 검증하고(예제 roi_img 데이터를 사용하라. 320x 320) Confirm 뒤 다음 단계를 진행하라.
+3. mfc와 Python코드는 동일한 keyFrame 판단 알고리즘을 사용하는가?
+
+#+end_src
