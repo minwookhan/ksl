@@ -523,8 +523,54 @@ UINT CgRPCFileClientDlg::gRPCSend(LPVOID pParam) //제일 늦음. 모든 속도�
 
 	CgRPCFileClientDlg* pDlg = (CgRPCFileClientDlg*)pParam;
 
+	// 1. 비디오 파일 경로 얻기
+	CString file_nm;
+	pDlg->m_video_file_name_edit.GetWindowText(file_nm);
+	if (file_nm.IsEmpty()) {
+		AfxMessageBox(_T("비디오 파일을 먼저 로드하세요."));
+		pDlg->hgRPCSend = nullptr;
+		return 0;
+	}
+
+	// 2. 비디오 캡처 열기
+	cv::VideoCapture cap(pDlg->m_util.StringToChar(file_nm));
+	if (!cap.isOpened()) {
+		AfxMessageBox(_T("비디오 파일을 열 수 없습니다."));
+		pDlg->hgRPCSend = nullptr;
+		return 0;
+	}
+
+	// 3. 처음 1장의 Frame 추출
+	cv::Mat firstFrame;
+	cap >> firstFrame;  // 첫 프레임 읽기
+	
+	if (firstFrame.empty()) {
+		AfxMessageBox(_T("비디오 파일에 프레임이 없습니다."));
+		cap.release();
+		pDlg->hgRPCSend = nullptr;
+		return 0;
+	}
+
+	// 4. 추출된 프레임 정보 출력 (디버깅용)
+	CString msg;
+	msg.Format(_T("첫 프레임 추출 완료: %dx%d, 채널: %d"), 
+		firstFrame.cols, firstFrame.rows, firstFrame.channels());
+	AfxMessageBox(msg);
+
+	// 5. AI 처리를 위해 프레임 저장
+	pDlg->m_cap_img = firstFrame.clone();
+	
+	// 6. AI 처리 시작 (MediaPipe 포즈 감지)
+	SetEvent(pDlg->hAIStart);
+	WaitForSingleObject(pDlg->hAIFinish, INFINITE);
+
+	// 7. gRPC 전송 (AI 처리 결과 포함)
+	// 실제 구현은 client.SendFrames()가 프레임 데이터를 받도록 수정 필요
+	// 현재는 세션 ID만 전송
 	client.SendFrames("SESSION_001");
 
+	// 8. 리소스 정리
+	cap.release();
 	pDlg->hgRPCSend = nullptr;
 
 	return 0;
