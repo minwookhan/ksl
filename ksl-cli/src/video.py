@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import logging
+import time
 from typing import Generator, Tuple
 from src.config import AppConfig
 
@@ -38,7 +39,10 @@ class VideoLoader:
             logger.info(f"Video opened successfully. Total frames: {total_frames}")
 
             while True:
+                start_read = time.time()
                 ret, frame = cap.read()
+                logger.debug(f"[ETA_LOG] 1. VideoLoading: {time.time() - start_read:.6f} sec")
+
                 if not ret:
                     logger.info("End of video reached or failed to read frame.")
                     break
@@ -48,7 +52,10 @@ class VideoLoader:
                     logger.warning("Empty frame read.")
                     continue
                     
+                start_pre = time.time()
                 processed_frame = self._preprocess(frame)
+                logger.debug(f"[ETA_LOG] 2. Preprocessed: {time.time() - start_pre:.6f} sec")
+
                 yield processed_frame
                 
         finally:
@@ -111,7 +118,7 @@ def calculate_optical_flow_value(prev_gray: np.ndarray, curr_gray: np.ndarray) -
     feature_params = dict(maxCorners=300,
                           qualityLevel=0.01,
                           minDistance=7,
-                          blockSize=7)
+                          blockSize=3)
     
     p0 = cv2.goodFeaturesToTrack(prev_gray, mask=None, **feature_params)
     
@@ -120,9 +127,9 @@ def calculate_optical_flow_value(prev_gray: np.ndarray, curr_gray: np.ndarray) -
         return 0.0
 
     # 2. Calculate Optical Flow (Lucas-Kanade)
-    lk_params = dict(winSize=(15, 15),
-                     maxLevel=2,
-                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    lk_params = dict(winSize=(21, 21),
+                     maxLevel=3,
+                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
     
     p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None, **lk_params)
 

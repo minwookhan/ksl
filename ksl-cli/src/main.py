@@ -2,6 +2,7 @@ import argparse
 import logging
 import sys
 import os
+import time
 from pathlib import Path
 from typing import Iterator, List, Optional
 import cv2
@@ -119,9 +120,11 @@ def process_video_stream(
                 avg_motion = 0.0
                 
                 # AI Inference
+                start_ai = time.time()
                 current_skeleton = pose_estimator.process_frame(frame_image_rgb)
+                logger.debug(f"[ETA_LOG] 4. AI 추론: {time.time() - start_ai:.6f} sec")
 
-                # Calculate Rdev/Ldev for debug
+                # 왼쪽 / 오른쪽 손목 이동 거리 계산 (디버그용)
                 r_dev = 0.0
                 l_dev = 0.0
                 if config.debug_file and prev_skeleton and current_skeleton and len(prev_skeleton) > 16 and len(current_skeleton) > 16:
@@ -155,7 +158,9 @@ def process_video_stream(
                 if hand_status != 0:
                     # Update Optical Flow only when hand is detected (Match C++ behavior)
                     if prev_gray is not None:
-                        avg_motion = calculate_optical_flow_value(prev_gray, curr_gray)
+                        start_flow = time.time()
+                        avg_motion = calculate_optical_flow_value(prev_gray, curr_gray) # python 과 mfc  버전 차이 있음.
+                        logger.debug(f"[ETA_LOG] 3. Optical Flow 계산: {time.time() - start_flow:.6f} sec")
                     prev_gray = curr_gray # Update reference frame only if hand status is valid
 
                     # 3. Hand Turn Detection
@@ -215,7 +220,8 @@ def process_video_stream(
                 # Encode to Protobuf Frame
                 # Only send if it is a keyframe
                 if should_send_keyframe:
-                    if config.save_keyframes_only:
+                    # Mode 1: Save Images Locally
+                    if config.save_keyframes_only == 1:
                         try:
                             kf_dir = Path("keyFrame")
                             kf_dir.mkdir(parents=True, exist_ok=True)
@@ -226,7 +232,12 @@ def process_video_stream(
                             saved_keyframe_count += 1
                         except Exception as e:
                             logger.error(f"Failed to save keyframe: {e}")
+                    
+                    # Mode 2: Encode only (useful for profiling or output file generation without IO overhead)
+                    elif config.save_keyframes_only == 2:
+                        pass # Do nothing special, just proceed to encode
 
+                    start_encode = time.time()
                     encoded_frame = encode_frame(
                         session_id=session_id,
                         index=frame_count,
@@ -234,6 +245,7 @@ def process_video_stream(
                         image=frame_image_rgb,
                         skeleton=current_skeleton
                     )
+                    logger.debug(f"[ETA_LOG] 5. 데이터 인코딩: {time.time() - start_encode:.6f} sec")
                     yield encoded_frame
                 
                 # Write to file if enabled (also only keyframes now)
@@ -250,8 +262,8 @@ def process_video_stream(
         
         use_offline_mode = False
         
-        if config.save_keyframes_only:
-            logger.info("Keyframe Only Mode enabled. Skipping gRPC connection.")
+        if config.save_keyframes_only > 0:
+            logger.info(f"Keyframe Only Mode ({config.save_keyframes_only}) enabled. Skipping gRPC connection.")
             use_offline_mode = True
         else:
             try:
@@ -321,8 +333,8 @@ def main():
                         help="Optional: Path to save the raw protobuf packet bytes stream (.bin file)")
     parser.add_argument("--frame", type=int, nargs=2, metavar=('START', 'END'),
                         help="Optional: Process only a specific range of frames (e.g. 100 500)")
-    parser.add_argument("--keyframeOnly", type=int, choices=[0, 1], default=0,
-                        help="If 1, extract and save KeyFrames to ./keyFrame folder without sending to gRPC.")
+    parser.add_argument("--keyframeOnly", type=int, choices=[0, 1, 2], default=0,
+                        help="0: Normal gRPC stream. 1: Save keyframe images locally (no gRPC). 2: Encode to Protobuf only (no gRPC, no local image save unless output set).")
     parser.add_argument("--log-level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "NONE"],
                         help="Set the logging level (default: INFO)")

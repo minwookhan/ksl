@@ -3,14 +3,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
 
-@dataclass(frozen=True)
+@dataclass
 class AppConfig:
-    """애플리케이션 실행 설정 (Immutable)"""
     video_path: Path
-    roi: Tuple[int, int, int, int]  # (x, y, w, h)
+    roi: Tuple[int, int, int, int]
     output_path: Optional[Path] = None
-    frame_range: Optional[Tuple[int, int]] = None  # (start_frame, end_frame)
-    save_keyframes_only: bool = False
+    frame_range: Optional[Tuple[int, int]] = None
+    save_keyframes_only: int = 0 # 0: gRPC, 1: Save Images, 2: Encode Only
     log_level: int = logging.INFO
     no_gui: bool = False
     debug_file: bool = False

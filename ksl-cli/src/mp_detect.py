@@ -20,8 +20,10 @@ def mediapipe_hand_func(img):
     입력: BGR 이미지 (np.ndarray, HxWx3)
     출력: np.array([all_x, all_y, all_z, all_vis], dtype=float32)
           - 정규화 좌표(0..1)
-          - 항상 'Right 21점' → 'Left 21점' 순으로 누적
-          - visibility는 미제공이므로 1.0으로 채움
+          - 한 손 마다 21개 포인트 감지, 최대 2손 (오른손+왼손): 42 포인트 길이 numpy 배열 리턴
+    데이터 정렬 순서
+     - 데이터는 항상 **오른손(Right)** 데이터가 먼저 오고, 그 뒤에 **왼손(Left)** 데이터가 붙는 순서로 정렬됩니다 (`Right → Left`).
+     - 각 손마다 **21개의 랜드마크** 포인트가 순서대로 나열됩니다.
     """
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if (img.ndim == 3 and img.shape[2] == 3) else img
     results = hands_image.process(rgb)

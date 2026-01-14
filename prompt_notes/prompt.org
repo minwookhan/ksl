@@ -320,3 +320,120 @@ The server receives an image stream from a client (`ksl-cli`), decodes the bytes
 **First Action:**
 Analyze the structure and constraints, then generate the **TODO List** to start the project.
 #+end_src
+* 시간 측정용 prompt
+#+begin_src markdown
+## Instruction
+- Log Level - debug 에서 출력하라.
+- Log 출력에 {ETA_LOG} 항목 내용을 출력하ㄹ
+- {ETA_LOG} 각 항목에 각각 걸리는 연산  시간을 출력하라.
+## {ETA_LOG}
+1. VideoLoading
+  - 사용 함수: `cv2.VideoCapture.read()` (OpenCV)
+2. Preprocessed
+   - 사용함수: VideoLoader._preprocess(frame) in (src/video.py)
+3. Optical Flow 계산
+  - 사용함수: calculate_optical_flow_value in (src/video.py)
+** 1. 영상 로드 (Video Loading)
+가장 처음 비디오 파일에서 원본 프레임을 읽어오는 단계입니다.
+
+***   **사용 함수**: `cv2.VideoCapture.read()` (OpenCV)
+***   **입력 데이터**: MP4 비디오 파일 스트림
+***   **출력 데이터 (Raw)**:
+    *   해상도: **1920 x 1080** (FHD)
+    *   채널: 3 (BGR)
+    *   **데이터 크기* *: $1920 \times 1080 \times 3 \text{ bytes} \approx \mathbf{6.22 \text{ MB}}$
+    *   설명: 압축이 풀린 순수 비트맵 데이터입니다.
+
+** 2. 전처리 (Preproce sing) - **데이터 급감 구간**
+AI 인식 속도 향상과 네트워크 대역폭 절약을 위해 이미지를 축소합니다.
+
+***   **사용 함수**: `VideoLoader._preprocess(frame)` (`src/video.py`)
+***   **주요 로직**:
+    1.  ROI Crop (지정된 영역 자르기)
+    2.  **Resize**: 가로 너비가 320px 이상이면 **320px**로 강제 축소 (비율 유지)
+    3.  Convert: BGR → RGB
+***   **출력 데이터 (Processed)**:
+    *   계산: 가로 320px 고정. 16:9 비율 유지 시 세로는 180px.
+    *   해상도: **320 x 180**
+    *   채널: 3 (RGB)
+    *   **데이터 크기**: $320 \times 180 \times 3 \text{ bytes} = \mathbf{172,800 \text{ bytes}} (\approx \mathbf{168 \text{ KB}})$
+    *   **변화**: 원본 대비 약 **2.7%** 크기로 감소.
+
+** 3. Optical Flow 계산 (Motion Detection)
+움직임 감지를 위해 흑백 영상을 사용합니다.
+
+***   **사용 함수**: `calculate_optical_flow_value` (`src/video.py`)
+    *   내부 호출: `cv2.cvtColor`, `cv2.calcOpticalFlowPyrLK`
+***   **입력 데이터**: 전처리된 320x180 RGB 이미지
+***   **변환 데이터 (Grayscale)**:
+    *   해상도: **320 x 180**
+    *   채널: 1 (Gray)
+    *   **데이터 크기**:
+       $320 \times 180 \times 1 \text{ bytes} = \mathbf{57,600 \text{ bytes}} (\approx \mathbf{56 \text{ KB}})$
+***   **출력 데이터**: `float` (8 bytes) - 움직임 평균값 하나만 반환.
+
+** 4. AI 추론 (MediaPipe Pose)
+인체 관절 포인트(Skeleton)를 추출합니다.
+
+***   **사용 함수**: `pose_estimator.process_frame` (`src/main.py`)
+***   **입력 데이터**: 320x180 RGB 이미지 (168 KB)
+***   **출력 데이터 (Skeleton)**:
+    *   구조: 33개의 랜드마크 (각 x, y, z, visibility, presence)
+    *   **데이터 크기**:
+        *   33 points $\times$ 5 floats $\times$ 4 bytes $\approx$ **660 bytes** (1 KB 미만)
+    *   설명: 이미지 크기에 비해 매우 작습니다.
+
+** 5. 데이터 인코딩 (Protobuf Encoding)
+서버로 보내기 위해 데이터를 직렬화합니다. **중요: 이미지를 압축(JPEG/PNG)하지 않고 Raw Byte로 보냅니다.**
+
+***   **사용 함수**: `encode_frame` (`src/network.py`)
+***   **입력 데이터**:
+    1.  이미지: 320x180 RGB Raw Data (168 KB)
+    2.  스켈레톤: 33 Points (0.6 KB)
+    3.  메타데이터: Session ID, Index 등 (수십 바이트)
+***   **출력 데이터 (pb2.Frame)**:
+    *   **패킷 크기**: **약 170 ~ 175 KB** (프레임 당)
+    *   설명: `image.tobytes()`를 사용하므로 픽셀 데이터가 그대로 들어갑니다.
+
+** 6. 네트워크 전송 (gRPC Streaming)
+***   **사용 함수**: `grpc_client.send_stream` (`src/network.py`)
+***   **전송량**: 키프레임(Keyframe)으로 선정된 프레임만 전송됩니다.
+    *   만약 1초에 5개의 키프레임이 발생한다면: $170 \text{ KB} \times 5 \approx \mathbf{850 \text{ KB/s}}$
+
+---
+
+### 요약 테이블
+
+| 단계 | 처리 내용 | 해상도 / 구조 | 데이터 크기 (Bytes) | 비고 |
+| :--- | :--- | :--- | :--- | :--- |
+| **1** | **원본 로드** | 1920 x 1080 (3ch) | **~6,220,800 (6.2 MB)** | `cv2` Read |
+| **2** | **전처리 (Resize)** | **320 x 180** (3ch) | **172,800 (168 KB)** | **가장 큰 변화 (강제 축소)** |
+| **3** | **모션 감지** | 320 x 180 (1ch) | 57,600 (56 KB) | 내부 연산용 (전송 X) |
+| **4** | **AI 데이터** | 33개 좌표 (Float) | ~660 (0.6 KB) | Skeleton |
+| **5** | **최종 패킷** | **Image Raw + AI** | **~175,000 (170 KB)** | **실제 전송량 (Per Keyframe)** |
+
+**결론**: FHD 영상을 넣더라도 `ksl-cli`는 내부적으로 **약 170KB 크기의 패킷**으로 가공하여 서버와 통신합니다. 대역폭 산정 시 원본 크기가 아닌 **320x180 해상도 기준**으로 계산해야 합니다.
+
+#+end_src
+* org 정리
+#+begin_src markdown
+## Instruction
+1. main.py 의 실행 과정을 정리하라
+2. main.py 에 연속된 2장의 frame image가 주어졌다 가정하라
+3. {Rule} 이 따라 정리 {output format} 으로 정리하라.
+
+## Rule
+1. 실행 순서에 따라 함수를 나열하라
+2. 각 함수의 입,출력 데이터의 종류, 크기와 설명을 포함하라
+3. 함수의 출처를 간략하게 포함하라.
+   ai.py 안에 있는 함수 func1()
+   [ai.py]_func1()
+4. 전체 코드목적에서 그 함수의 기능의미를 포함시켜 설명하라.
+5. 코드의 indent 부분은 org 문서의 indent level 로 표현하라.
+6. 함수 내부를 자세히는 설명하지 말고 함수 이름 단위로 설명하라.
+
+
+## output format
+- org-mode
+- 레벨 유지
+#+end_src

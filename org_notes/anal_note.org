@@ -471,6 +471,7 @@ MediaPipe를 이용해 인체 랜드마크(스켈레톤)를 추출합니다.
 *** 3. 모션 강도 분석 (Optical Flow)
 프레임 간의 픽셀 변화량을 계산하여 움직임이 멈추었는지(정지 동작) 판단합니다.
 
+- [[id:3e43cf43-c0b8-4986-a449-64f2e076ed6a][Optical Flow 설명]]
 - *함수 위치*: =gRPCFileClientDlg.cpp= -> =GetMotionVauleWithOpticalFlow=
 - *입력*:
   - =cv::Mat roi=: 현재 프레임의 ROI 이미지
@@ -2276,3 +2277,464 @@ if speak_start_flag and avg_motion < OPTICAL_FLOW_THRESH and frozen_flag == 0 an
 
 *** 요약
 C++ 코드의 알고리즘 흐름과 상수 값(=700=, =30.0=, =0.8=, =0.45=, =3=)이 Python 코드로 *정확하게 1:1 이식*되었습니다. 따라서 두 클라이언트는 동일한 비디오 입력에 대해 *거의 동일한 타이밍의 KeyFrame을 검출*하게 됩니다.
+* python code 실행 과정과 시간 유추
+`ksl-cli`는 **FHD (1920x1080)** 원본 영상을 입력받더라도, 내부 로직에 의해 **가로 320px**로 리사이징된 데이터를 주로 처리하고 전송합니다.
+
+다음은 데이터 흐름에 따른 각 단계별 함수와 처리되는 데이터의 크기 분석입니다.
+*(가정: ROI를 설정하지 않고 1920x1080 전체를 처리한다고 가정할 때)*
+
+---
+
+** 처리과정
+*** 1. 영상 로드 (Video Loading)
+가장 처음 비디오 파일에서 원본 프레임을 읽어오는 단계입니다.
+
+****   **사용 함수**: `cv2.VideoCapture.read()` (OpenCV)
+****   **입력 데이터**: MP4 비디오 파일 스트림
+****   **출력 데이터 (Raw)**:
+    *   해상도: **1920 x 1080** (FHD)
+    *   채널: 3 (BGR)
+    *   **데이터 크기* *: $1920 \times 1080 \times 3 \text{ bytes} \approx \mathbf{6.22 \text{ MB}}$
+    *   설명: 압축이 풀린 순수 비트맵 데이터입니다.
+
+*** 2. 전처리 (Preproce sing) - **데이터 급감 구간**
+AI 인식 속도 향상과 네트워크 대역폭 절약을 위해 이미지를 축소합니다.
+
+****   **사용 함수**: `VideoLoader._preprocess(frame)` (`src/video.py`)
+****   **주요 로직**:
+    1.  ROI Crop (지정된 영역 자르기)
+    2.  **Resize**: 가로 너비가 320px 이상이면 **320px**로 강제 축소 (비율 유지)
+    3.  Convert: BGR → RGB
+****   **출력 데이터 (Processed)**:
+    *   계산: 가로 320px 고정. 16:9 비율 유지 시 세로는 180px.
+    *   해상도: **320 x 180**
+    *   채널: 3 (RGB)
+    *   **데이터 크기**: $320 \times 180 \times 3 \text{ bytes} = \mathbf{172,800 \text{ bytes}} (\approx \mathbf{168 \text{ KB}})$
+    *   **변화**: 원본 대비 약 **2.7%** 크기로 감소.
+
+*** 3. Optical Flow 계산 (Motion Detection)
+움직임 감지를 위해 흑백 영상을 사용합니다.
+
+****   **사용 함수**: `calculate_optical_flow_value` (`src/video.py`)
+    *   내부 호출: `cv2.cvtColor`, `cv2.calcOpticalFlowPyrLK`
+****   **입력 데이터**: 전처리된 320x180 RGB 이미지
+****   **변환 데이터 (Grayscale)**:
+    *   해상도: **320 x 180**
+    *   채널: 1 (Gray)
+    *   **데이터 크기**:
+       $320 \times 180 \times 1 \text{ bytes} = \mathbf{57,600 \text{ bytes}} (\approx \mathbf{56 \text{ KB}})$
+****   **출력 데이터**: `float` (8 bytes) - 움직임 평균값 하나만 반환.
+
+*** 4. AI 추론 (MediaPipe Pose)
+인체 관절 포인트(Skeleton)를 추출합니다.
+
+****   **사용 함수**: `pose_estimator.process_frame` (`src/main.py`)
+****   **입력 데이터**: 320x180 RGB 이미지 (168 KB)
+****   **출력 데이터 (Skeleton)**:
+    *   구조: 33개의 랜드마크 (각 x, y, z, visibility, presence)
+    *   **데이터 크기**:
+        *   33 points $\times$ 5 floats $\times$ 4 bytes $\approx$ **660 bytes** (1 KB 미만)
+    *   설명: 이미지 크기에 비해 매우 작습니다.
+
+*** 5. 데이터 인코딩 (Protobuf Encoding)
+서버로 보내기 위해 데이터를 직렬화합니다. **중요: 이미지를 압축(JPEG/PNG)하지 않고 Raw Byte로 보냅니다.**
+
+****   **사용 함수**: `encode_frame` (`src/network.py`)
+****   **입력 데이터**:
+    1.  이미지: 320x180 RGB Raw Data (168 KB)
+    2.  스켈레톤: 33 Points (0.6 KB)
+    3.  메타데이터: Session ID, Index 등 (수십 바이트)
+****   **출력 데이터 (pb2.Frame)**:
+    *   **패킷 크기**: **약 170 ~ 175 KB** (프레임 당)
+    *   설명: `image.tobytes()`를 사용하므로 픽셀 데이터가 그대로 들어갑니다.
+
+*** 6. 네트워크 전송 (gRPC Streaming)
+****   **사용 함수**: `grpc_client.send_stream` (`src/network.py`)
+****   **전송량**: 키프레임(Keyframe)으로 선정된 프레임만 전송됩니다.
+    *   만약 1초에 5개의 키프레임이 발생한다면: $170 \text{ KB} \times 5 \approx \mathbf{850 \text{ KB/s}}$
+
+---
+
+### 요약 테이블
+
+| 단계 | 처리 내용 | 해상도 / 구조 | 데이터 크기 (Bytes) | 비고 |
+| :--- | :--- | :--- | :--- | :--- |
+| **1** | **원본 로드** | 1920 x 1080 (3ch) | **~6,220,800 (6.2 MB)** | `cv2` Read |
+| **2** | **전처리 (Resize)** | **320 x 180** (3ch) | **172,800 (168 KB)** | **가장 큰 변화 (강제 축소)** |
+| **3** | **모션 감지** | 320 x 180 (1ch) | 57,600 (56 KB) | 내부 연산용 (전송 X) |
+| **4** | **AI 데이터** | 33개 좌표 (Float) | ~660 (0.6 KB) | Skeleton |
+| **5** | **최종 패킷** | **Image Raw + AI** | **~175,000 (170 KB)** | **실제 전송량 (Per Keyframe)** |
+
+**결론**: FHD 영상을 넣더라도 `ksl-cli`는 내부적으로 **약 170KB 크기의 패킷**으로 가공하여 서버와 통신합니다. 대역폭 산정 시 원본 크기가 아닌 **320x180 해상도 기준**으로 계산해야 합니다.
+** 시간 테스트결과
+- filename : 5.mp4
+- frame range:  669- 835
+- 추출 keyframe 개수: 15
+*** 집계 대상: `[ETA_LOG] 1~4 단계`
+
+| 단계 | 항목          | 샘플 수 | 평균 (sec) | 평균 (ms) | 중앙값 (ms) | 최소~최대 (ms)    |
+|  -: | ------------ |   ---: |  -------: |  ------: |   -------: | --------------: |
+|   1 | VideoLoading |    836 |  0.001082 |    1.082 |      0.828 | 0.771 ~ 37.046  |
+|   2 | PreProcessed |    836 |  0.000057 |    0.057 |      0.056 | 0.043 ~ 0.191   |
+|   3 | Optical Flow |     73 |  0.001527 |    1.527 |      1.454 | 1.225 ~ 2.751   |
+|   4 | AI 추론       |    167 |  0.039057 |   39.057 |     39.712 | 24.533 ~ 55.249 |
+
+
+  * 단계별 샘플 수 불일치
+  * 3단계 73회, 4단계 167회, 1~2단계 836회
+  * 1단계 최대값 37.046ms 한 건, 초기 1회성 지연 가능성
+** perf stat
+- perf 명령어
+1. 기본 stat
+    Performance counter stats for 'python ./src/main.py ../5.mp4 740,377,266,300 --model-path ksl-cli/protos/pose_landmarker_full.task --log-level DEBUG --frame 669 835 --keyframeOnly 2':
+
+         16,361.93 msec task-clock                       #    1.387 CPUs utilized
+            28,961      context-switches                 #    1.770 K/sec
+             4,830      cpu-migrations                   #  295.197 /sec
+           175,594      page-faults                      #   10.732 K/sec
+   150,126,221,462      instructions                     #    2.26  insn per cycle
+                                                  #    0.04  stalled cycles per insn
+    66,303,092,598      cycles                           #    4.052 GHz
+     6,698,014,455      stalled-cycles-frontend          #   10.10% frontend cycles idle
+    12,404,349,146      branches                         #  758.123 M/sec
+       330,428,647      branch-misses                    #    2.66% of all branches
+
+      11.799065668 seconds time elapsed
+
+      13.981134000 seconds user
+       2.456133000 seconds sys
+
+2. 단계별 코드 블럭 측정
+3. instruction 기준 측정
+   Performance counter stats for 'python ./src/main.py ../5.mp4 740,377,266,300 --model-path ksl-cli/protos/pose_landmarker_full.task --log-level DEBUG --frame 669 835 --keyframeOnly 2' (5 runs):
+
+   141,600,871,063      instructions                     #    2.67  insn per cycle              ( +-  0.01% )
+    53,099,250,580      cycles                                                                  ( +-  0.50% )
+       706,261,092      cache-misses                                                            ( +-  0.19% )
+
+           12.9878 +- 0.0724 seconds time elapsed  ( +-  0.56% )
+** jetson nano orion 비교 예상
+아래 비교는 **현재 측정값(Ryzen 5 5600)** 을 기준으로
+**Jetson Orin Nano**에서 실행했을 때를 **정량적으로 추정·해석**한 것이다.
+
+---
+
+## 기준 데이터 (현재 PC)
+
+**** CPU
+  * AMD Ryzen 5 5600
+  * 6C / 12T
+  * 실효 클럭 ≈ 4.2 GHz
+**** 측정 결과
+  * instructions
+
+    * **141.6 Billion**
+  * IPC
+
+    * **2.67**
+  * time
+
+    * **12.99 s**
+
+---
+
+## Jetson Orin Nano CPU 특성
+
+**** CPU
+
+  * ARM Cortex-A78AE
+  * 6-core
+**** 클럭
+
+  * 최대 ≈ **1.5 ~ 1.7 GHz**
+**** IPC 특성
+
+  * x86 대비 낮음
+  * 실효 IPC ≈ **1.5 ~ 2.0** 수준
+
+---
+
+## 1️⃣ Instruction 수 비교
+
+**** **동일**
+**** 이유
+
+  * 프로그램 로직 동일
+  * 알고리즘 동일
+  * 입력 동일
+
+```text
+Ryzen 5600 ≈ 141.6B instructions
+Orin Nano  ≈ 141.6B instructions
+```
+
+→ 연산 “양”은 동일
+
+---
+
+## 2️⃣ IPC 비교
+
+| CPU        | IPC (실효)   |
+| ---------- | ---------- |
+| Ryzen 5600 | ~2.6 ~ 2.8 |
+| Orin Nano  | ~1.6 ~ 2.0 |
+
+**** Orin Nano
+
+  * 파이프라인 폭 작음
+  * 분기·벡터 처리 불리
+
+---
+
+## 3️⃣ 클럭 비교
+
+| CPU        | 평균 클럭    |
+| ---------- | -------- |
+| Ryzen 5600 | ~4.2 GHz |
+| Orin Nano  | ~1.6 GHz |
+
+**** **약 2.6배 차이**
+
+---
+
+## 4️⃣ 실행 시간 추정 공식
+
+```text
+시간 ∝ instructions / (IPC × clock)
+```
+
+---
+
+## 5️⃣ 시간 비율 계산 (보수적 추정)
+
+```text
+Ryzen 성능 기준 = 2.67 × 4.2 = 11.21
+Orin 성능 기준  = 1.8 × 1.6 = 2.88
+```
+
+```text
+속도 비 ≈ 11.21 / 2.88 ≈ 3.9
+```
+
+---
+
+## 6️⃣ 최종 실행 시간 추정
+
+```text
+Orin Nano 예상 시간
+≈ 12.99 s × 3.9
+≈ 50 ~ 55 초
+```
+
+---
+
+## 7️⃣ 실제 체감 가능 범위
+
+**** **CPU-only 실행**
+
+  * **45 ~ 60초**
+**** 메모리·I/O 포함 시
+
+  * **60초 초과 가능**
+
+---
+
+## 8️⃣ 중요한 전제
+
+**** 위 비교는
+
+  * **AI 추론이 CPU에서 실행된 경우**
+**** 만약 Orin에서
+
+  * TensorRT
+  * CUDA
+  * GPU/DLA 오프로딩 사용 시
+
+👉 **AI 단계는 역전 가능**
+
+---
+
+## 핵심 결론
+
+**** CPU 기준
+
+  * Jetson Orin Nano는
+
+    * Ryzen 5600 대비 **약 4배 느림**
+**** 성능 개선 방향
+
+  * CPU 최적화 ❌ (이미 한계)
+  * **AI 추론 GPU/DLA 이전 필수**
+  * Optical Flow / Preprocess 병렬화 필요
+
+---
+
+## 한 줄 요약
+
+**** **같은 코드를 CPU로만 돌리면 Orin Nano는 약 50초대**
+**** **Orin의 가치는 CPU가 아니라 GPU·DLA 활용에 있음**
+*** 표로 정리
+| 항목                | AMD Ryzen 5 5600 (PC) | Jetson Orin Nano     | 의미                    |
+| ----------------   | --------------------- | -------------------- | ---------------        |
+| CPU 아키텍처         | x86-64 (Zen 3)        | ARMv8 (Cortex-A78AE) | 명령어 집합·파이프라인 차이 |
+| 코어 / 스레드        | 6C / 12T              | 6C / 6T              | SMT 유무                |
+| 평균 동작 클럭        | ~4.2 GHz              | ~1.6 GHz             | 실효 클럭 차이            |
+| 실효 IPC            | ~2.6 ~ 2.8            | ~1.6 ~ 2.0           | 사이클당 처리량           |
+| CPU 단일코어 성능 지수 | 11.2                  | 2.9                  | IPC × Clock           |
+| 실행 instruction 수 | **141.6B**              | **141.6B (동일)**       | 연산 “양”               |
+| 사용 cycles (추정)   | 53.1B                 | ~80 ~ 90B            | IPC·클럭 영향           |
+| 평균 실행 시간        | **12.99 s**             | **45 ~ 60 s (추정)**    | CPU-only               |
+| 상대 실행 시간        | 1×                   | **~3.9× 느림**         | CPU 기준                |
+| 캐시 미스 영향        | 낮음                   | 낮음                  | 메모리 병목 아님          |
+| CPU 병목 여부        | 있음                   | 있음                  | 연산 중심                |
+***
+아래는 **이번 비교에 사용한 `perf` 명령어들을 org-mode 형식으로 정리**한 내용이다.
+요청대로 **노드 레벨(계층) 유지**.
+
+---
+
+* perf 명령어 정리 (CPU 비교 목적별)
+
+** 1. 전체 CPU 연산 로드 비교 (핵심 기준)
+*** 목적
+
+  * CPU 종류와 무관한 *절대 연산량(workload)* 비교
+  * 다른 CPU에서의 실행 시간 추정 기준 확보
+*** 명령어
+  #+begin_src bash
+  taskset -c 0 perf stat -r 5 
+  -e instructions,cycles 
+  python ./src/main.py <args...>
+  #+end_src
+*** 핵심 지표
+
+  * instructions :: CPU가 실제 수행한 명령 총량
+  * cycles :: 실행에 사용된 클럭 사이클 수
+*** 의미
+
+  * instructions 값이 같으면 “같은 일을 했다”
+  * CPU 비교의 출발점
+
+---
+
+** 2. CPU 효율 (IPC) 비교
+
+*** 목적
+
+  * 동일한 연산량을 CPU가 얼마나 효율적으로 처리했는지 판단
+*** 명령어
+  #+begin_src bash
+  perf stat -e instructions,cycles python ./src/main.py <args...>
+  #+end_src
+*** 계산 지표
+
+  * IPC = instructions / cycles
+*** 의미
+
+  * IPC가 높을수록 파이프라인 효율 우수
+  * x86 ↔ ARM 성능 차이 설명 가능
+
+---
+
+** 3. 메모리 병목 여부 확인
+*** 목적
+
+  * 성능 저하 원인이 CPU 연산인지 메모리 접근인지 구분
+*** 명령어
+  #+begin_src bash
+  perf stat -e cache-misses,cache-references 
+  python ./src/main.py <args...>
+  #+end_src
+*** 핵심 지표
+
+  * cache-misses
+  * miss 비율
+*** 의미
+
+  * cache miss 비율이 낮으면 연산 중심 워크로드
+  * CPU 성능 비교의 신뢰도 확보
+
+---
+
+** 4. 반복 실행으로 평균값 확보
+
+*** 목적
+
+  * 실행 편차 제거
+  * 측정 안정성 확보
+*** 명령어
+  #+begin_src bash
+  perf stat -r 5 python ./src/main.py <args...>
+  #+end_src
+*** 의미
+
+  * 스케줄링, I/O, thermal 영향 감소
+  * Jetson 계열에서 특히 중요
+
+---
+
+** 5. CPU 코어 고정 (공정 비교 필수)
+
+*** 목적
+
+  * 코어 이동 제거
+  * 클럭 변동 영향 최소화
+*** 명령어
+  #+begin_src bash
+  taskset -c 0 perf stat python ./src/main.py <args...>
+  #+end_src
+*** 의미
+
+  * PC ↔ 임베디드 비교 시 필수 조건
+  * 결과 재현성 확보
+
+---
+
+** 6. 병목 위치 분석 (정성 분석)
+
+*** 목적
+
+  * 시간이 어디에서 소비되는지 확인
+  * 최적화 방향 결정
+*** 명령어
+  #+begin_src bash
+  perf record python ./src/main.py <args...>
+  perf report
+  #+end_src
+*** 의미
+  * Python 인터프리터 내부 vs C/CUDA 코드 구분
+  * GPU/DLA 오프로딩 판단 근거
+
+---
+
+** 7. CPU 비교용 최종 권장 명령어
+
+*** 목적
+
+  * 서로 다른 CPU를 *가장 공정하게* 비교
+*** 명령어
+  #+begin_src bash
+  taskset -c 0 perf stat -r 5 
+  -e instructions,cycles,cache-misses 
+  python ./src/main.py <args...>
+  #+end_src
+*** 이 명령으로 얻는 것
+
+  * 연산량 :: instructions
+  * CPU 효율 :: IPC
+  * 메모리 병목 여부 :: cache-misses
+  * 평균 실행 시간
+---
+** 요약
+
+- instructions
+
+  * “얼마나 많은 일을 했는가”
+- IPC × 클럭
+
+  * “얼마나 빨리 처리했는가”
+- perf
+
+  * CPU 간 성능 비교의 기준 도구
+
+
