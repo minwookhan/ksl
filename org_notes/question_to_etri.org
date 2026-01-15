@@ -1,0 +1,2 @@
+* keyframe  개수 바뀐다.
+- 반복 할 때 마다 keyframe 개수 변화

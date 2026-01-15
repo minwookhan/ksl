@@ -10,6 +10,7 @@ class AppConfig:
     output_path: Optional[Path] = None
     frame_range: Optional[Tuple[int, int]] = None
     save_keyframes_only: int = 0 # 0: gRPC, 1: Save Images, 2: Encode Only
+    save_keyframe: bool = False  # New: Save sending images to ./sending_keyframe
     log_level: int = logging.INFO
     no_gui: bool = False
     debug_file: bool = False

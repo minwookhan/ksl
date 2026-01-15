@@ -2,8 +2,16 @@ import cv2
 import numpy as np
 import logging
 import time
-from typing import Generator, Tuple
+from typing import Generator, Tuple, List, Optional
 from src.config import AppConfig
+
+# Generated gRPC modules
+try:
+    from src import ksl_sentence_recognition_pb2 as pb2
+except ImportError:
+    import ksl_sentence_recognition_pb2 as pb2
+
+from src.ai import MediaPipePoseEstimator, SkeletonPoint
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +28,18 @@ def parse_roi(roi_str: str) -> Tuple[int, int, int, int]:
         raise ValueError(f"Invalid ROI format. Expected 'x,y,w,h', got '{roi_str}'")
 
 class VideoLoader:
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, pose_estimator: Optional[MediaPipePoseEstimator] = None):
         self.config = config
+        self.pose_estimator = pose_estimator
 
-    def get_frames(self) -> Generator[np.ndarray, None, None]:
+    def get_frames(self) -> Generator[Tuple[np.ndarray, List[pb2.Point3], List[SkeletonPoint]], None, None]:
         """
-        Yields preprocessed frames from the video file.
+        Yields preprocessed frames and generated pose data.
+        Returns:
+            Tuple[np.ndarray, List[pb2.Point3], List[SkeletonPoint]]
+            - processed_frame: RGB image
+            - proto_pose_points: List of Point3 for gRPC
+            - skeleton: List of SkeletonPoint for internal logic
         """
         video_path = str(self.config.video_path)
         logger.info(f"Opening video file: {video_path}")
@@ -38,6 +52,16 @@ class VideoLoader:
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             logger.info(f"Video opened successfully. Total frames: {total_frames}")
 
+            current_frame_index = 0
+            end_frame = total_frames
+
+            if self.config.frame_range:
+                start_frame, end_frame = self.config.frame_range
+                if start_frame > 0:
+                    logger.info(f"Seeking to frame {start_frame}")
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                    current_frame_index = start_frame
+
             while True:
                 start_read = time.time()
                 ret, frame = cap.read()
@@ -47,6 +71,12 @@ class VideoLoader:
                     logger.info("End of video reached or failed to read frame.")
                     break
                 
+                current_frame_index += 1
+                
+                if current_frame_index > end_frame:
+                    logger.info(f"Reached end of specified frame range ({end_frame}). Stopping.")
+                    break
+
                 # Check if frame is valid
                 if frame is None or frame.size == 0:
                     logger.warning("Empty frame read.")
@@ -56,7 +86,20 @@ class VideoLoader:
                 processed_frame = self._preprocess(frame)
                 logger.debug(f"[ETA_LOG] 2. Preprocessed: {time.time() - start_pre:.6f} sec")
 
-                yield processed_frame
+                # Generate Pose Data if estimator is available
+                proto_pose_points: List[pb2.Point3] = []
+                current_skeleton: List[SkeletonPoint] = []
+
+                if self.pose_estimator:
+                    start_ai = time.time()
+                    current_skeleton = self.pose_estimator.process_frame(processed_frame)
+                    logger.debug(f"[ETA_LOG] 4. AI 추론: {time.time() - start_ai:.6f} sec")
+                    
+                    # Convert to gRPC format (Pose Data Only)
+                    for sp in current_skeleton:
+                        proto_pose_points.append(pb2.Point3(x=sp.x, y=sp.y, z=sp.z))
+
+                yield processed_frame, proto_pose_points, current_skeleton
                 
         finally:
             cap.release()

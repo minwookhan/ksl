@@ -1,0 +1,154 @@
+% Created 2026-01-12 Mon 12:04
+% Intended LaTeX compiler: pdflatex
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{wrapfig}
+\usepackage{rotating}
+\usepackage[normalem]{ulem}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{capt-of}
+\usepackage{hyperref}
+\author{minwook Han}
+\date{\today}
+\title{}
+\hypersetup{
+ pdfauthor={minwook Han},
+ pdftitle={},
+ pdfkeywords={},
+ pdfsubject={},
+ pdfcreator={Emacs 30.1 (Org mode 9.7.31)}, 
+ pdflang={English}}
+\begin{document}
+
+\tableofcontents
+
+import cv2
+import numpy as np
+import logging
+from typing import Generator, Tuple
+from src.config import AppConfig
+
+logger = logging.getLogger(\uline{\uline{name}})
+
+def parse\textsubscript{roi}(roi\textsubscript{str}: str) -> Tuple[int, int, int, int]:
+    ``''``
+    Parses `x,y,w,h' string into a tuple of integers.
+    ''``''
+    try:
+        parts = [int(p.strip()) for p in roi\textsubscript{str.split}(',')]
+        if len(parts) != 4:
+            raise ValueError
+        return tuple(parts) \# type: ignore
+    except (ValueError, AttributeError):
+        raise ValueError(f``Invalid ROI format. Expected `x,y,w,h', got '\{roi\textsubscript{str}\}''')
+
+class VideoLoader:
+    def \_\textsubscript{init}\_\textsubscript{(self, config: AppConfig)}:
+        self.config = config
+
+def get\textsubscript{frames}(self) -> Generator[np.ndarray, None, None]:
+    ``''``
+    Yields preprocessed frames from the video file.
+    ''``''
+    video\textsubscript{path} = str(self.config.video\textsubscript{path})
+    logger.info(f``Opening video file: \{video\textsubscript{path}\}'')
+    cap = cv2.VideoCapture(video\textsubscript{path})
+
+try:
+    if not cap.isOpened():
+        raise IOError(f``Cannot open video file: \{self.config.video\textsubscript{path}\}'')
+
+total\textsubscript{frames} = int(cap.get(cv2.CAP\textsubscript{PROP}\textsubscript{FRAME}\textsubscript{COUNT}))
+logger.info(f``Video opened successfully. Total frames: \{total\textsubscript{frames}\}'')
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        logger.info(``End of video reached or failed to read frame.'')
+        break
+
+if frame is None or frame.size == 0:
+    logger.warning(``Empty frame read.'')
+    continue
+
+processed\textsubscript{frame} = self.\textsubscript{preprocess}(frame)
+yield processed\textsubscript{frame}
+
+finally:
+    cap.release()
+    logger.info(``VideoLoader released.'')
+
+def \_preprocess(self, frame: np.ndarray) -> np.ndarray:
+    ``''``
+    Applies ROI crop, Resize (if needed), and Color conversion.
+    ''``''
+    x, y, w, h = self.config.roi
+
+roi\textsubscript{frame} = frame[y:y+h, x:x+w]
+
+if roi\textsubscript{frame.size} == 0:
+
+return roi\textsubscript{frame}
+
+rows, cols = roi\textsubscript{frame.shape}{[}:2]
+if cols >= 320:
+    target\textsubscript{x} = 320.0
+    scale = target\textsubscript{x} / cols
+
+new\textsubscript{width} = int(cols * scale)
+new\textsubscript{height} = int(rows * scale)
+roi\textsubscript{frame} = cv2.resize(roi\textsubscript{frame}, (new\textsubscript{width}, new\textsubscript{height}), interpolation=cv2.INTER\textsubscript{LINEAR})
+
+rgb\textsubscript{frame} = cv2.cvtColor(roi\textsubscript{frame}, cv2.COLOR\textsubscript{BGR2RGB})
+
+return rgb\textsubscript{frame}
+
+def calculate\textsubscript{optical}\textsubscript{flow}\textsubscript{value}(prev\textsubscript{gray}: np.ndarray, curr\textsubscript{gray}: np.ndarray) -> float:
+    ``''"
+    Calculates the average motion magnitude between two grayscale frames using Sparse Optical Flow (Lucas-Kanade).
+    Matches the C++ implementation to ensure consistent thresholding behavior.
+
+Input: prev\textsubscript{gray}, curr\textsubscript{gray} (uint8 grayscale images)
+Output: float (average motion magnitude of tracked points)
+``''"
+if prev\textsubscript{gray} is None or curr\textsubscript{gray} is None:
+    return 0.0
+
+if prev\textsubscript{gray.shape} != curr\textsubscript{gray.shape}:
+    return 0.0
+
+feature\textsubscript{params} = dict(maxCorners=300,
+                      qualityLevel=0.01,
+                      minDistance=7,
+                      blockSize=7)
+
+p0 = cv2.goodFeaturesToTrack(prev\textsubscript{gray}, mask=None, **feature\textsubscript{params})
+
+if p0 is None:
+    return 0.0
+
+lk\textsubscript{params} = dict(winSize=(15, 15),
+                 maxLevel=2,
+                 criteria=(cv2.TERM\textsubscript{CRITERIA}\textsubscript{EPS} | cv2.TERM\textsubscript{CRITERIA}\textsubscript{COUNT}, 10, 0.03))
+
+p1, st, err = cv2.calcOpticalFlowPyrLK(prev\textsubscript{gray}, curr\textsubscript{gray}, p0, None, **lk\textsubscript{params})
+
+if p1 is not None:
+
+good\textsubscript{new} = p1[st \texttt{= 1]
+        good\_old = p0[st =} 1]
+
+if len(good\textsubscript{new}) == 0:
+    return 0.0
+
+displacements = np.linalg.norm(good\textsubscript{new} - good\textsubscript{old}, axis=1)
+
+avg\textsubscript{motion} = np.mean(displacements)
+return float(avg\textsubscript{motion})
+
+return 0.0
+\end{document}

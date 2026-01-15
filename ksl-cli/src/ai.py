@@ -2,7 +2,7 @@ import numpy as np
 import cv2
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
-from src.mp_detect import mediapipe_pose_func, mediapipe_hand_func
+from src.mp_detect import mediapipe_pose_func
 
 @dataclass(frozen=True)
 class SkeletonPoint:
@@ -51,22 +51,4 @@ class MediaPipePoseEstimator:
                     visibility=float(vis[i])
                 ))
 
-        # Add Hand Landmarks
-        # Returns np.array([all_x, all_y, all_z, all_side])
-        hand_result_array = mediapipe_hand_func(image_bgr)
-
-        if hand_result_array.ndim == 2 and hand_result_array.shape[0] == 4 and hand_result_array.shape[1] > 0:
-            xs = hand_result_array[0]
-            ys = hand_result_array[1]
-            zs = hand_result_array[2]
-            sides = hand_result_array[3] # 1.0 for Right, 0.0 for Left
-
-            for i in range(len(xs)):
-                all_landmarks.append(SkeletonPoint(
-                    x=float(xs[i]),
-                    y=float(ys[i]),
-                    z=float(zs[i]),
-                    visibility=float(sides[i]) 
-                ))
-                
         return all_landmarks

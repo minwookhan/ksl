@@ -1,0 +1,178 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN">
+<!-- Created by htmlize-1.57 in css mode. -->
+<html>
+  <head>
+    <title>video.py</title>
+    <style type="text/css">
+    <!--
+      body {
+        color: #bbc2cf;
+        background-color: #282c34;
+      }
+      .hl-line {
+        /* hl-line */
+        background-color: #21242b;
+      }
+
+      a {
+        color: inherit;
+        background-color: inherit;
+        font: inherit;
+        text-decoration: inherit;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+    -->
+    </style>
+  </head>
+  <body>
+    <pre>
+<span class="hl-line">import cv2
+</span>import numpy as np
+import logging
+from typing import Generator, Tuple
+from src.config import AppConfig
+
+logger = logging.getLogger(__name__)
+
+def parse_roi(roi_str: str) -&gt; Tuple[int, int, int, int]:
+    """
+    Parses 'x,y,w,h' string into a tuple of integers.
+    """
+    try:
+        parts = [int(p.strip()) for p in roi_str.split(',')]
+        if len(parts) != 4:
+            raise ValueError
+        return tuple(parts) # type: ignore
+    except (ValueError, AttributeError):
+        raise ValueError(f"Invalid ROI format. Expected 'x,y,w,h', got '{roi_str}'")
+
+class VideoLoader:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def get_frames(self) -&gt; Generator[np.ndarray, None, None]:
+        """
+        Yields preprocessed frames from the video file.
+        """
+        video_path = str(self.config.video_path)
+        logger.info(f"Opening video file: {video_path}")
+        cap = cv2.VideoCapture(video_path)
+        
+        try:
+            if not cap.isOpened():
+                raise IOError(f"Cannot open video file: {self.config.video_path}")
+            
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            logger.info(f"Video opened successfully. Total frames: {total_frames}")
+
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    logger.info("End of video reached or failed to read frame.")
+                    break
+                
+                # Check if frame is valid
+                if frame is None or frame.size == 0:
+                    logger.warning("Empty frame read.")
+                    continue
+                    
+                processed_frame = self._preprocess(frame)
+                yield processed_frame
+                
+        finally:
+            cap.release()
+            logger.info("VideoLoader released.")
+    
+    def _preprocess(self, frame: np.ndarray) -&gt; np.ndarray:
+        """
+        Applies ROI crop, Resize (if needed), and Color conversion.
+        """
+        x, y, w, h = self.config.roi
+        
+        # 1. ROI Crop (Safe slicing)
+        # Note: frame shape is (height, width, channels)
+        # Slicing: frame[y:y+h, x:x+w]
+        roi_frame = frame[y:y+h, x:x+w]
+        
+        if roi_frame.size == 0:
+             # ROI&#44032; &#51060;&#48120;&#51648; &#48276;&#50948;&#47484; &#48279;&#50612;&#45212; &#44221;&#50864; &#48712; &#54532;&#47112;&#51076; &#48152;&#54872; &#44032;&#45733;&#49457; &#45824;&#48708;
+             # &#49892;&#51228;&#47196;&#45716; &#49444;&#51221; &#45800;&#44228;&#50640;&#49436; &#47561;&#50500;&#50556; &#54616;&#51648;&#47564; &#50504;&#51204;&#51109;&#52824;
+             return roi_frame
+
+        # 2. Resize Logic (Match C++ implementation)
+        # if (roi.cols &gt;= 320) ...
+        rows, cols = roi_frame.shape[:2]
+        if cols &gt;= 320:
+            target_x = 320.0
+            scale = target_x / cols
+            # cv2.resize takes (width, height)
+            new_width = int(cols * scale)
+            new_height = int(rows * scale)
+            roi_frame = cv2.resize(roi_frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+            
+        # 3. BGR to RGB (MediaPipe requires RGB)
+        # C++ &#53076;&#46300;&#50640;&#49436;&#45716; BGR &#44536;&#45824;&#47196; MP&#47196; &#45336;&#44592;&#45716; &#46319; &#54664;&#51004;&#45208;(OpenCV &#44592;&#48376;),
+        # MediaPipe Python API&#45716; &#47749;&#49884;&#51201;&#51004;&#47196; RGB &#51077;&#47141;&#51012; &#44428;&#51109;&#54633;&#45768;&#45796;.
+        # &#50896;&#48376; &#48516;&#49437; &#44208;&#44284;: dst_img = pDlg-&gt;m_cap_img.clone(); ... cvtColor(..., COLOR_BGRA2BGR)
+        # C++ &#53076;&#46300;&#45716; BGRA &#52376;&#47532;&#47564; &#51080;&#44256; BGR-&gt;RGB &#48320;&#54872;&#51060; &#47749;&#49884;&#51201;&#51004;&#47196; &#50504; &#48372;&#51068; &#49688; &#51080;&#51004;&#45208;,
+        # Python MediaPipe&#45716; RGB&#47484; &#44592;&#45824;&#54616;&#48064;&#47196; &#50668;&#44592;&#49436; &#48320;&#54872;&#54616;&#45716; &#44163;&#51060; &#50504;&#51204;&#54633;&#45768;&#45796;.
+        rgb_frame = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
+        
+        return rgb_frame
+
+def calculate_optical_flow_value(prev_gray: np.ndarray, curr_gray: np.ndarray) -&gt; float:
+    """
+    Calculates the average motion magnitude between two grayscale frames using Sparse Optical Flow (Lucas-Kanade).
+    Matches the C++ implementation to ensure consistent thresholding behavior.
+    
+    Input: prev_gray, curr_gray (uint8 grayscale images)
+    Output: float (average motion magnitude of tracked points)
+    """
+    if prev_gray is None or curr_gray is None:
+        return 0.0
+    
+    if prev_gray.shape != curr_gray.shape:
+        return 0.0
+
+    # 1. Detect feature points to track (Sparse)
+    # Parameters match typical C++ OpenCV defaults or common usage if not specified
+    feature_params = dict(maxCorners=300,
+                          qualityLevel=0.01,
+                          minDistance=7,
+                          blockSize=7)
+    
+    p0 = cv2.goodFeaturesToTrack(prev_gray, mask=None, **feature_params)
+    
+    # If no features found, motion is 0
+    if p0 is None:
+        return 0.0
+
+    # 2. Calculate Optical Flow (Lucas-Kanade)
+    lk_params = dict(winSize=(15, 15),
+                     maxLevel=2,
+                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    
+    p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None, **lk_params)
+
+    # 3. Calculate Average Motion of Valid Points
+    if p1 is not None:
+        # Select good points
+        good_new = p1[st == 1]
+        good_old = p0[st == 1]
+        
+        if len(good_new) == 0:
+            return 0.0
+            
+        # Calculate Euclidean distances
+        displacements = np.linalg.norm(good_new - good_old, axis=1)
+        
+        # Average magnitude
+        avg_motion = np.mean(displacements)
+        return float(avg_motion)
+        
+    return 0.0
+</pre>
+  </body>
+</html>

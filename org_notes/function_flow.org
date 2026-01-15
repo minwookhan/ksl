@@ -1,0 +1,115 @@
+* 1 st 분석
+[main.py]_main()
+  프로그램의 시작점입니다. 명령행 인자를 파싱하고, 설정(Config)을 로드하며, 핵심 모듈들(Loader, AI, Network)을 초기화한 후 메인 처리 파이프라인을 실행합니다.
+** [main.py]_parse_roi() (via src.video)
+   - **입력**: 문자열 `args.roi` (예: "100,100,640,480")
+   - **출력**: 튜플 `(x, y, w, h)` (정수형)
+   - **설명**: 사용자가 입력한 관심 영역(ROI) 좌표 문자열을 파싱하여 정수 튜플로 변환합니다.
+** [config.py]_AppConfig()
+   - **입력**: `args` (파싱된 명령행 인자들: video_path, roi, server 등)
+   - **출력**: `AppConfig` 객체
+   - **설명**: 애플리케이션 전반에서 사용될 설정 정보를 담은 불변(Immutable) 데이터 객체를 생성합니다.
+** [video.py]_VideoLoader()
+   - **입력**: `AppConfig` 객체
+   - **출력**: `VideoLoader` 인스턴스
+   - **설명**: 지정된 경로의 비디오 파일을 열고, 프레임을 순차적으로 읽어올 준비를 하는 로더 객체를 초기화합니다.
+** [ai.py]_MediaPipePoseEstimator()
+   - **입력**: `model_path` (문자열)
+   - **출력**: `MediaPipePoseEstimator` 인스턴스
+   - **설명**: Google MediaPipe Pose 랜드마크 모델을 로드하고 추론 엔진을 준비합니다.
+
+** [network.py]_GrpcClient()
+   - **입력**: `server_address` (문자열, 예: "localhost:50051")
+   - **출력**: `GrpcClient` 인스턴스
+   - **설명**: gRPC 서버와 통신할 클라이언트 객체를 생성하고 채널을 설정합니다.
+
+** [main.py]_process_video_stream()
+   - **입력**: `config`, `video_loader`, `pose_estimator`, `grpc_client`
+   - **출력**: 없음 (None)
+   - **설명**: 비디오의 모든 프레임을 순회하며 AI 분석, 로직 처리, 서버 전송을 총괄하는 메인 루프 함수입니다.
+
+*** [logic.py]_HandTurnDetector() (초기화)
+    - **입력**: 없음
+    - **출력**: `HandTurnDetector` 인스턴스 (2개: `right_hand_detector`, `left_hand_detector`)
+    - **설명**: 손의 급격한 움직임 변화를 감지하기 위한 상태 추적 객체를 생성합니다.
+
+*** [network.py]_GrpcClient.connect()
+    - **입력**: 없음
+    - **출력**: 없음
+    - **설명**: 설정된 서버 주소로 gRPC 채널 연결을 시도하고 준비 상태를 확인합니다.
+
+*** [network.py]_GrpcClient.send_stream()
+    - **입력**: `frame_generator()` (Python Generator)
+    - **출력**: `response_iterator` (gRPC 응답 스트림)
+    - **설명**: 내부 함수 `frame_generator`가 생성하는 데이터 패킷을 서버로 실시간 스트리밍 전송합니다.
+
+**** Frame 1 Processing (첫 번째 프레임 루프)
+
+***** [video.py]_VideoLoader.get_frames()
+      - **입력**: 내부 비디오 파일 스트림
+      - **출력**: `frame_image_rgb` (Numpy Array: HxWx3)
+      - **설명**: 비디오에서 첫 번째 프레임 이미지를 읽어 RGB 포맷으로 반환합니다.
+
+***** [ai.py]_MediaPipePoseEstimator.process_frame()
+      - **입력**: `frame_image_rgb`
+      - **출력**: `current_skeleton` (List[SkeletonPoint], 길이 33)
+      - **설명**: 이미지에서 인체 포즈 랜드마크(33개 관절 좌표)를 추출합니다.
+
+***** [logic.py]_get_motion_status_from_mp()
+      - **입력**: `current_motion_status` (READY), `current_skeleton`, `prev_skeleton` (빈 리스트)
+      - **출력**: `motion_status` (int)
+      - **설명**: 이전 프레임 정보가 없으므로 움직임 상태를 초기값(READY)으로 유지합니다.
+
+***** [logic.py]_get_rough_hand_status_from_mp()
+      - **입력**: `current_skeleton`
+      - **출력**: `hand_status` (int: 0=내림, 1~3=손듦)
+      - **설명**: 손목의 Y좌표를 기준값과 비교하여 현재 손이 들려있는지(수어 준비 상태인지) 판단합니다.
+
+***** [logic.py]_HandTurnDetector.update()
+      - **입력**: `wrist_coord` (손목 좌표), `dt` (시간 간격)
+      - **출력**: `False` (bool)
+      - **설명**: 비교할 이전 프레임 위치가 없으므로 현재 위치만 저장하고 `False`를 반환합니다.
+
+**** Frame 2 Processing (두 번째 프레임 루프)
+
+***** [video.py]_VideoLoader.get_frames()
+      - **입력**: 내부 비디오 파일 스트림
+      - **출력**: `frame_image_rgb` (Numpy Array: HxWx3)
+      - **설명**: 비디오에서 두 번째 프레임 이미지를 읽어옵니다.
+
+***** [ai.py]_MediaPipePoseEstimator.process_frame()
+      - **입력**: `frame_image_rgb`
+      - **출력**: `current_skeleton` (List[SkeletonPoint])
+      - **설명**: 두 번째 프레임의 인체 포즈 랜드마크를 추출합니다.
+
+***** [logic.py]_get_motion_status_from_mp()
+      - **입력**: `current_motion_status`, `current_skeleton`, `prev_skeleton` (Frame 1 데이터)
+      - **출력**: `motion_status` (int)
+      - **설명**: Frame 1과 Frame 2 사이의 관절 이동 거리를 계산하여 현재 움직임 상태(SPEAK, RAPID, READY)를 판별합니다.
+
+***** [logic.py]_get_rough_hand_status_from_mp()
+      - **입력**: `current_skeleton`
+      - **출력**: `hand_status` (int)
+      - **설명**: 현재 프레임에서 손이 들려있는지 다시 확인합니다.
+
+***** [video.py]_calculate_optical_flow_value() (조건부 실행)
+      - **입력**: `prev_gray` (Frame 1 흑백이미지), `curr_gray` (Frame 2 흑백이미지)
+      - **출력**: `avg_motion` (float)
+      - **설명**: `hand_status != 0`일 때, 두 프레임 간 픽셀 단위의 평균 이동량을 계산하여 동작의 정지 여부를 판단하는 척도로 사용합니다.
+
+***** [logic.py]_HandTurnDetector.update()
+      - **입력**: `wrist_coord` (Frame 2), `dt`
+      - **출력**: `is_turn_detected` (bool)
+      - **설명**: Frame 1의 손목 위치와 Frame 2의 위치를 비교하여 급격한 방향 전환(Turn)이 발생했는지 감지합니다.
+
+***** [network.py]_encode_frame() (조건부 실행: Keyframe일 경우)
+      - **입력**: `session_id`, `index`, `flag`, `image`, `skeleton`
+      - **출력**: `encoded_frame` (Protobuf Message)
+      - **설명**: 키프레임 전송 조건(motion < thresh 등)이 충족되면, 현재 프레임 데이터와 골격 정보를 서버 전송용 Protobuf 포맷으로 직렬화합니다.
+
+***** [network.py]_GrpcClient (내부 스트리밍)
+      - **입력**: `encoded_frame` (yield된 데이터)
+      - **출력**: 서버 응답
+      - **설명**: 제너레이터에서 yield된 인코딩 데이터를 gRPC 채널을 통해 서버로 전송합니다.
+ 
+*      - **설명**: (키프레임 조건 만족 시) 데이터를 직렬화 가능한 Protobuf 메시지 객체로 변환하여 생성기(Generator)를 통해 반환(yield)합니다.

@@ -52,7 +52,7 @@ def process_video_stream(
     Main pipeline to process video, perform AI inference, apply logic, and stream via gRPC.
     """
     session_id = f"session_{Path(config.video_path).stem}_{os.getpid()}"
-    frame_count = 0
+    frame_count = config.frame_range[0] if config.frame_range else 0
     prev_skeleton: List[SkeletonPoint] = []
     current_motion_status: int = READY_MOTION_STATUS # Initial state
     right_hand_detector = HandTurnDetector()
@@ -98,17 +98,8 @@ def process_video_stream(
         def frame_generator() -> Iterator[pb2.Frame]:
             nonlocal frame_count, prev_skeleton, current_motion_status, prev_gray, speak_start_flag, frozen_flag, saved_keyframe_count, detected_keyframes, debug_csv_writer # For updating outer scope variables
             
-            for frame_image_rgb in video_loader.get_frames():
+            for frame_image_rgb, proto_pose_points, current_skeleton in video_loader.get_frames():
                 frame_count += 1
-
-                # Check frame range if specified
-                if config.frame_range:
-                    start_frame, end_frame = config.frame_range
-                    if frame_count < start_frame:
-                        continue
-                    if frame_count > end_frame:
-                        logger.info(f"Reached end of specified frame range ({end_frame}). Stopping.")
-                        break
 
                 if frame_count % 30 == 0:
                     logger.info(f"Processing frame {frame_count}")
@@ -119,11 +110,8 @@ def process_video_stream(
                 curr_gray = cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2GRAY)
                 avg_motion = 0.0
                 
-                # AI Inference
-                start_ai = time.time()
-                current_skeleton = pose_estimator.process_frame(frame_image_rgb)
-                logger.debug(f"[ETA_LOG] 4. AI 추론: {time.time() - start_ai:.6f} sec")
-
+                # AI Inference (Handled in VideoLoader)
+                
                 # 왼쪽 / 오른쪽 손목 이동 거리 계산 (디버그용)
                 r_dev = 0.0
                 l_dev = 0.0
@@ -200,6 +188,11 @@ def process_video_stream(
                 # Visualization (Pop window update)
                 if not config.no_gui:
                     try:
+                        # Ensure window is created (once)
+                        if frame_count == 1 or (config.frame_range and frame_count == config.frame_range[0]):
+                             cv2.namedWindow("KSL Client Stream", cv2.WINDOW_NORMAL)
+                             logger.info("GUI mode enabled. Creating window.")
+
                         # Convert RGB (from VideoLoader) to BGR (for OpenCV Display)
                         vis_img = cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2BGR)
 
@@ -215,12 +208,28 @@ def process_video_stream(
                         if cv2.waitKey(1) & 0xFF == 27: # ESC to stop strictly if needed
                             pass 
                     except Exception as e:
-                        logger.debug(f"Visualization error (headless?): {e}")
+                        logger.warning(f"Visualization error (headless?): {e}")
 
                 # Encode to Protobuf Frame
                 # Only send if it is a keyframe
                 if should_send_keyframe:
-                    # Mode 1: Save Images Locally
+                    # Save sending keyframe image if --keyframe option is set
+                    if config.save_keyframe:
+                        try:
+                            save_dir = Path("sending_keyframe")
+                            save_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Format: HHMM_frameIndex.jpg
+                            time_prefix = time.strftime("%H%M")
+                            save_filename = save_dir / f"{time_prefix}_{frame_count}.jpg"
+                            
+                            # Convert RGB back to BGR for cv2.imwrite
+                            cv2.imwrite(str(save_filename), cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2BGR))
+                            logger.info(f"Saved sending keyframe to {save_filename}")
+                        except Exception as e:
+                            logger.error(f"Failed to save sending keyframe: {e}")
+
+                    # Mode 1: Save Images Locally (Original feature)
                     if config.save_keyframes_only == 1:
                         try:
                             kf_dir = Path("keyFrame")
@@ -339,6 +348,7 @@ def main():
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "NONE"],
                         help="Set the logging level (default: INFO)")
     parser.add_argument("--no-gui", action="store_true", help="Disable video visualization (OpenCV imshow).")
+    parser.add_argument("--keyframe", action="store_true", help="Save sending keyframe images to ./sending_keyframe as HHMM_frameIndex.jpg")
     parser.add_argument("--debugFile", action="store_true", help="Save debug information (motion values) to a CSV file.")
 
     args = parser.parse_args()
@@ -360,7 +370,8 @@ def main():
             roi=parsed_roi,
             output_path=args.output,
             frame_range=tuple(args.frame) if args.frame else None,
-            save_keyframes_only=bool(args.keyframeOnly),
+            save_keyframes_only=args.keyframeOnly,
+            save_keyframe=args.keyframe,
             log_level=log_level_val,
             no_gui=args.no_gui,
             debug_file=args.debugFile
@@ -373,8 +384,8 @@ def main():
              logger.warning(f"Model path {args.model_path} does not exist. Trying absolute path or check config.")
              # You might want to raise an error here depending on strictness
 
-        video_loader = VideoLoader(config)
         pose_estimator = MediaPipePoseEstimator(str(args.model_path)) # Model path as string
+        video_loader = VideoLoader(config, pose_estimator)
         grpc_client = GrpcClient(args.server)
 
         # Run processing pipeline
