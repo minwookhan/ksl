@@ -437,3 +437,73 @@ AI 인식 속도 향상과 네트워크 대역폭 절약을 위해 이미지를 
 - org-mode
 - 레벨 유지
 #+end_src
+* log prompt
+** 1st
+#+begin_src markdown
+## Instruction
+1. log 기록을 남긴다.
+2. 각 Frame마다 {log_Structure} 구조로 csv 로 저장한다
+./debug/현재시간분_동영상이름_.csv
+ex)10시12분에 5.mp4 실행했을때 1012_5.csv
+## log_Structure
+0. debug outfolder:  ./debug
+1. 필드
+ - Frame number: 영상의 프레임 번호
+ - Rdev : Rdev 값
+- Ldev: Ldev 값
+- pose.x: mediapipe의 pose estimator결과  x좌표
+- pose.y: mediapipe의 pose estimator결과  y좌표
+- pose.z: mediapipe의 pose estimator결과  z좌표
+- avg_motion: avg_motion
+ex) 100 프레임과 101 프레임 average값은 frame number 100  의 avg_motion 으로 할당.
+
+2. 필드 구조
+Frame number| Rdev|Ldev| pose data|
+3. roi 영역으로 crop된 이미지를 저장하라.
+- {debug_folder}/frame/실행시간분/동영상제목_프레임번호.jpg
+ 키프레임은
+{debug_folder}/frame/실행시간분/동영상제목_프레임번호_k.jpg
+ex) 5.mp4
+./debug/frame/1012/5_1234.jpg
+
+
+
+#+end_src
+** 2nd debug 구조 변경
+#+begin_src markdown
+## Instruction
+- debug 파일 저장 구조를 변경한다.
+1. ./debug 폴더 밑에 아래와 같은 구조로 저정된다.
+2. debugging csv 파일 : ./debug/동영상제목/{startframenumber_endframenumber}_debug.csv
+3. keyframe리스트 파일  : ./debug/동영상제목/{startframenumber_endframenumber}_keyframe_.csv
+4. frame 이미지: ./debug/동영상제목/frame/
+#+end_src
+**
+** csv land mark  추가
+#+begin_src markdown
+debug 파일(csv)에서 각 프레임의 pose landmarkd 33 개의 모든  x, y,z 좌표를 추가하라.()
+pose.x, pose.y, pose.z 를 각 landmarkdw의 field로 사용
+- example
+Frame number| Rdev|Ldev| pose_0.x| pose_0.y| pose_0.z| pose_1.x| pose_1.y| pose_1.z| pose_2.x| pose_2.y| pose_2.z| pose_3.x| pose_3.y| pose_3.z| pose_4.x| pose_4.y| pose_4.z| pose_5.x| pose_5.y| pose_5.z| pose_6.x| pose_6.y| pose_6.z| pose_7.x| pose_7.y| pose_7.z| pose_8.x| pose_8.y| pose_8.z| pose_9.x| pose_9.y| pose_9.z| pose_10.x| pose_10.y| pose_10.z| pose_11.x| pose_11.y| pose_11.z| pose_12.x| pose_12.y| pose_12.z| pose_13.x| pose_13.y| pose_13.z| pose_14.x| pose_14.y| pose_14.z| pose_15.x| pose_15.y| pose_15.z| pose_16.x| pose_16.y| pose_16.z| pose_17.x| pose_17.y| pose_17.z| pose_18.x| pose_18.y| pose_18.z| pose_19.x| pose_19.y| pose_19.z| pose_20.x| pose_20.y| pose_20.z| pose_21.x| pose_21.y| pose_21.z| pose_22.x| pose_22.y| pose_22.z| pose_23.x| pose_23.y| pose_23.z| pose_24.x| pose_24.y| pose_24.z| pose_25.x| pose_25.y| pose_25.z| pose_26.x| pose_26.y| pose_26.z| pose_27.x| pose_27.y| pose_27.z| pose_28.x| pose_28.y| pose_28.z| pose_29.x| pose_29.y| pose_29.z| pose_30.x| pose_30.y| pose_30.z| pose_31.x| pose_31.y| pose_31.z| pose_32.x| pose_32.y| pose_32.z| avg_motion| keyFrame|
+#+end_src
+#+end_src
+** 3rd debug 저장 경로 변경
+#+begin_src markdown
+
+- debug 파일 저장 구조를 변경한다.
+1. ./debug 폴더 밑에 아래와 같은 구조로 저정된다.
+2. debugging csv 파일 : ./debug/동영상제목/{startframenumber_endframenumber}/{startframenumber_endframenumber}_debug.csv
+3. keyframe리스트 파일  : ./debug/동영상제목/{startframenumber_endframenumber}/{startframenumber_endframenumber}_keyframe_.csv
+4. frame 이미지: ./debug/동영상제목/{startframenumber_endframenumber}/frame
+
+#+end_src
+* csv  두 개 비교
+#+begin_src markdown
+0. 아래와 같은 python code  작성하라.
+ex) python compare_csv.py linux_669_835.csv 669_csv
+1. 두 개의 csv 을 비교한다.
+2. 같은 이름에 하나는 "linux" 가 head text 가 붙어 있다.
+3. {frame structure}의 필드 이름 중에서 {Frame number} 기준으로 다른 필드의 값을 비교하라.
+4. 결과 보고서 양식
+ - {frame_number} 별로 차이 값들 표시하라 (filed name  유지 )
+#+end_src

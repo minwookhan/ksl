@@ -32,12 +32,13 @@ class VideoLoader:
         self.config = config
         self.pose_estimator = pose_estimator
 
-    def get_frames(self) -> Generator[Tuple[np.ndarray, List[pb2.Point3], List[SkeletonPoint]], None, None]:
+    def get_frames(self) -> Generator[Tuple[np.ndarray, np.ndarray, List[pb2.Point3], List[SkeletonPoint]], None, None]:
         """
         Yields preprocessed frames and generated pose data.
         Returns:
-            Tuple[np.ndarray, List[pb2.Point3], List[SkeletonPoint]]
-            - processed_frame: RGB image
+            Tuple[np.ndarray, np.ndarray, List[pb2.Point3], List[SkeletonPoint]]
+            - processed_frame: RGB image (Resized if needed, for AI/Display)
+            - original_roi_frame: RGB image (Original ROI size, for Optical Flow)
             - proto_pose_points: List of Point3 for gRPC
             - skeleton: List of SkeletonPoint for internal logic
         """
@@ -83,7 +84,7 @@ class VideoLoader:
                     continue
                     
                 start_pre = time.time()
-                processed_frame = self._preprocess(frame)
+                processed_frame, original_roi_frame = self._preprocess(frame)
                 logger.debug(f"[ETA_LOG] 2. Preprocessed: {time.time() - start_pre:.6f} sec")
 
                 # Generate Pose Data if estimator is available
@@ -92,6 +93,7 @@ class VideoLoader:
 
                 if self.pose_estimator:
                     start_ai = time.time()
+                    # Use processed_frame (resized) for AI
                     current_skeleton = self.pose_estimator.process_frame(processed_frame)
                     logger.debug(f"[ETA_LOG] 4. AI 추론: {time.time() - start_ai:.6f} sec")
                     
@@ -99,48 +101,45 @@ class VideoLoader:
                     for sp in current_skeleton:
                         proto_pose_points.append(pb2.Point3(x=sp.x, y=sp.y, z=sp.z))
 
-                yield processed_frame, proto_pose_points, current_skeleton
+                yield processed_frame, original_roi_frame, proto_pose_points, current_skeleton
                 
         finally:
             cap.release()
             logger.info("VideoLoader released.")
     
-    def _preprocess(self, frame: np.ndarray) -> np.ndarray:
+    def _preprocess(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Applies ROI crop, Resize (if needed), and Color conversion.
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: (resized_rgb_frame, original_roi_rgb_frame)
         """
         x, y, w, h = self.config.roi
         
         # 1. ROI Crop (Safe slicing)
-        # Note: frame shape is (height, width, channels)
-        # Slicing: frame[y:y+h, x:x+w]
         roi_frame = frame[y:y+h, x:x+w]
         
         if roi_frame.size == 0:
-             # ROI가 이미지 범위를 벗어난 경우 빈 프레임 반환 가능성 대비
-             # 실제로는 설정 단계에서 막아야 하지만 안전장치
-             return roi_frame
+             return roi_frame, roi_frame
+
+        # Create original ROI frame in RGB for return (used for Optical Flow calculation match with C++)
+        # C++ calculates flow on 'roi' which is the original cropped BGR frame.
+        # Python calculates flow on GRAY converted from this return.
+        # We return RGB here to be consistent with image format, main.py will convert to GRAY.
+        original_roi_rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
 
         # 2. Resize Logic (Match C++ implementation)
-        # if (roi.cols >= 320) ...
         rows, cols = roi_frame.shape[:2]
         if cols >= 320:
             target_x = 320.0
             scale = target_x / cols
-            # cv2.resize takes (width, height)
             new_width = int(cols * scale)
             new_height = int(rows * scale)
             roi_frame = cv2.resize(roi_frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
             
         # 3. BGR to RGB (MediaPipe requires RGB)
-        # C++ 코드에서는 BGR 그대로 MP로 넘기는 듯 했으나(OpenCV 기본),
-        # MediaPipe Python API는 명시적으로 RGB 입력을 권장합니다.
-        # 원본 분석 결과: dst_img = pDlg->m_cap_img.clone(); ... cvtColor(..., COLOR_BGRA2BGR)
-        # C++ 코드는 BGRA 처리만 있고 BGR->RGB 변환이 명시적으로 안 보일 수 있으나,
-        # Python MediaPipe는 RGB를 기대하므로 여기서 변환하는 것이 안전합니다.
         rgb_frame = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
         
-        return rgb_frame
+        return rgb_frame, original_roi_rgb
 
 def calculate_optical_flow_value(prev_gray: np.ndarray, curr_gray: np.ndarray) -> float:
     """

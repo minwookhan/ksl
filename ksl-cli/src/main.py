@@ -77,28 +77,63 @@ def process_video_stream(
             except OSError as e:
                 logger.error(f"Failed to open output file: {e}")
 
-        # Prepare debug CSV file if enabled
+        # Prepare debug output if enabled
         debug_csv_file = None
         debug_csv_writer = None
+        debug_keyframe_file = None
+        debug_keyframe_writer = None
+        debug_frame_dir = None
+        
         if config.debug_file:
             try:
+                video_stem = config.video_path.stem
                 start_f = config.frame_range[0] if config.frame_range else 0
                 end_f = config.frame_range[1] if config.frame_range else "end"
-                # Construct filename: video_filename_start_end.csv
-                video_name = config.video_path.name
-                csv_filename = f"{video_name}_{start_f}_{end_f}.csv"
+                
+                # 0. Debug Outfolder: ./debug/{VideoName}/{start_f}_{end_f}
+                debug_root = Path("./debug") / video_stem / f"{start_f}_{end_f}"
+                debug_root.mkdir(parents=True, exist_ok=True)
+                
+                # 1. Debug CSV Logging Setup
+                # Name: linux_{startFrame}_{endFrame}_debug.csv
+                csv_filename = debug_root / f"linux_{start_f}_{end_f}_debug.csv"
+                
+                # Generate Headers
+                csv_headers = ['Frame number', 'Rdev', 'Ldev']
+                for i in range(33):
+                    csv_headers.extend([f'pose_{i}.x', f'pose_{i}.y', f'pose_{i}.z'])
+                csv_headers.extend(['avg_motion', 'keyFrame'])
                 
                 debug_csv_file = open(csv_filename, 'w', newline='')
                 debug_csv_writer = csv.writer(debug_csv_file)
-                debug_csv_writer.writerow(['frame_index', 'avg_motion', 'Rdev', 'Ldev'])
+                debug_csv_writer.writerow(csv_headers)
                 logger.info(f"Saving debug info to {csv_filename}")
+                
+                # 2. Keyframe CSV Logging Setup
+                # Name: linux_{startFrame}_{endFrame}_keyframe_.csv
+                keyframe_csv_filename = debug_root / f"linux_{start_f}_{end_f}_keyframe_.csv"
+                debug_keyframe_file = open(keyframe_csv_filename, 'w', newline='')
+                debug_keyframe_writer = csv.writer(debug_keyframe_file)
+                debug_keyframe_writer.writerow(csv_headers)
+                logger.info(f"Saving keyframe list to {keyframe_csv_filename}")
+
+                # 3. Image Saving Setup
+                # Path: ./debug/{VideoName}/{start_f}_{end_f}/frame/
+                debug_frame_dir = debug_root / "frame"
+                debug_frame_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Saving debug frames to {debug_frame_dir}")
+
             except OSError as e:
-                logger.error(f"Failed to open debug CSV file: {e}")
+                logger.error(f"Failed to setup debug resources: {e}")
 
         def frame_generator() -> Iterator[pb2.Frame]:
-            nonlocal frame_count, prev_skeleton, current_motion_status, prev_gray, speak_start_flag, frozen_flag, saved_keyframe_count, detected_keyframes, debug_csv_writer # For updating outer scope variables
+            nonlocal frame_count, prev_skeleton, current_motion_status, prev_gray, speak_start_flag, frozen_flag, saved_keyframe_count, detected_keyframes, debug_csv_writer, debug_keyframe_writer, debug_frame_dir
             
-            for frame_image_rgb, proto_pose_points, current_skeleton in video_loader.get_frames():
+            # To assign motion(N, N+1) to frame N, we buffer the data of frame N
+            # Stores (frame_count, r_dev, l_dev, [pose_0.x, pose_0.y, pose_0.z, ... pose_32.z], is_keyframe)
+            pending_log_data = None 
+
+            for frame_image_rgb, original_roi_frame, proto_pose_points, current_skeleton in video_loader.get_frames():
                 frame_count += 1
 
                 if frame_count % 30 == 0:
@@ -107,81 +142,114 @@ def process_video_stream(
                     logger.debug(f"Processing frame {frame_count}")
 
                 # 1. Optical Flow Calculation
-                curr_gray = cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2GRAY)
+                # Use original_roi_frame (unresized) for Optical Flow to match C++ behavior
+                curr_gray = cv2.cvtColor(original_roi_frame, cv2.COLOR_RGB2GRAY)
                 avg_motion = 0.0
                 
-                # AI Inference (Handled in VideoLoader)
-                
-                # 왼쪽 / 오른쪽 손목 이동 거리 계산 (디버그용)
+                # Calculate Rdev/Ldev/Pose for CURRENT frame
                 r_dev = 0.0
                 l_dev = 0.0
-                if config.debug_file and prev_skeleton and current_skeleton and len(prev_skeleton) > 16 and len(current_skeleton) > 16:
-                     right_wrist_idx = 16
-                     left_wrist_idx = 15
-                     prev_R = np.array([prev_skeleton[right_wrist_idx].x, prev_skeleton[right_wrist_idx].y])
-                     cur_R = np.array([current_skeleton[right_wrist_idx].x, current_skeleton[right_wrist_idx].y])
-                     r_dev = float(np.linalg.norm(cur_R - prev_R))
+                pose_data = [0.0] * (33 * 3) # 33 landmarks * 3 coords
+                
+                if current_skeleton and len(current_skeleton) > 16:
+                     if prev_skeleton and len(prev_skeleton) > 16:
+                         right_wrist_idx = 16
+                         left_wrist_idx = 15
+                         prev_R = np.array([prev_skeleton[right_wrist_idx].x, prev_skeleton[right_wrist_idx].y])
+                         cur_R = np.array([current_skeleton[right_wrist_idx].x, current_skeleton[right_wrist_idx].y])
+                         r_dev = float(np.linalg.norm(cur_R - prev_R))
+                         
+                         prev_L = np.array([prev_skeleton[left_wrist_idx].x, prev_skeleton[left_wrist_idx].y])
+                         cur_L = np.array([current_skeleton[left_wrist_idx].x, current_skeleton[left_wrist_idx].y])
+                         l_dev = float(np.linalg.norm(cur_L - prev_L))
                      
-                     prev_L = np.array([prev_skeleton[left_wrist_idx].x, prev_skeleton[left_wrist_idx].y])
-                     cur_L = np.array([current_skeleton[left_wrist_idx].x, current_skeleton[left_wrist_idx].y])
-                     l_dev = float(np.linalg.norm(cur_L - prev_L))
+                     # Fill pose data
+                     for i in range(min(len(current_skeleton), 33)):
+                         pose_data[i*3] = current_skeleton[i].x
+                         pose_data[i*3+1] = current_skeleton[i].y
+                         pose_data[i*3+2] = current_skeleton[i].z
 
-                if debug_csv_writer:
-                    debug_csv_writer.writerow([frame_count, avg_motion, r_dev, l_dev])
+                # If we have a pending log from PREVIOUS frame, we can now write it with the motion calculated between PREV and CURR
+                if debug_csv_writer and pending_log_data:
+                    # avg_motion here is motion from pending_log_data's frame to this frame
+                    # Calculate motion only if prev_gray exists
+                    flow_val = 0.0
+                    if prev_gray is not None:
+                        flow_val = calculate_optical_flow_value(prev_gray, curr_gray)
+                    
+                    # Write row for PREVIOUS frame
+                    # pending_log_data structure: [Frame, Rdev, Ldev, ...PoseData..., KeyFrame]
+                    # Desired CSV Row: [Frame, Rdev, Ldev, ...PoseData..., AvgMotion, KeyFrame]
+                    
+                    # pending_log_data[:-1] is everything except KeyFrame
+                    # pending_log_data[-1] is KeyFrame
+                    row_data = list(pending_log_data[:-1]) + [flow_val, pending_log_data[-1]]
+                    
+                    debug_csv_writer.writerow(row_data)
+                    
+                    # Write to Keyframe CSV if it was a keyframe
+                    if pending_log_data[-1] == 1 and debug_keyframe_writer:
+                        debug_keyframe_writer.writerow(row_data)
+
+                    # Update avg_motion for logic usage (it belongs to the CURRENT frame processing loop)
+                    avg_motion = flow_val
 
                 # Business Logic & State Management
-                # Update motion status
                 current_motion_status = get_motion_status_from_mp(
                     current_motion_status,
                     current_skeleton,
                     prev_skeleton
                 )
                 
-                # 2. Pre-condition Check: Hand Status
-                # Must be != 0 (Ready/Down) to proceed with KeyFrame logic
                 hand_status = get_rough_hand_status_from_mp(current_skeleton)
-                
                 is_turn_detected = False
                 
                 if hand_status != 0:
-                    # Update Optical Flow only when hand is detected (Match C++ behavior)
-                    if prev_gray is not None:
-                        start_flow = time.time()
-                        avg_motion = calculate_optical_flow_value(prev_gray, curr_gray) # python 과 mfc  버전 차이 있음.
-                        logger.debug(f"[ETA_LOG] 3. Optical Flow 계산: {time.time() - start_flow:.6f} sec")
-                    prev_gray = curr_gray # Update reference frame only if hand status is valid
+                    # C++ behavior: Optical Flow is used in Keyframe logic.
+                    # My logic above already calculated flow_val if prev_gray existed.
+                    # We use that for avg_motion.
+                    
+                    # Update prev_gray only if hand status is valid (Match C++ behavior)
+                    prev_gray = curr_gray 
 
-                    # 3. Hand Turn Detection
-                    if len(current_skeleton) > 16: # Ensure wrist landmarks exist
+                    if len(current_skeleton) > 16:
                         right_wrist = (current_skeleton[16].x, current_skeleton[16].y)
                         left_wrist = (current_skeleton[15].x, current_skeleton[15].y)
-                        
                         DUMMY_DT = 1 / 30.0 
-
                         if right_hand_detector.update(right_wrist, DUMMY_DT):
-                            logger.debug(f"Frame {frame_count}: Right turn detected")
                             is_turn_detected = True
                         if left_hand_detector.update(left_wrist, DUMMY_DT):
-                            logger.debug(f"Frame {frame_count}: Left turn detected")
                             is_turn_detected = True
                 
-                # Logic: Turn Detected -> Set speak_start_flag
                 if is_turn_detected:
                     speak_start_flag = True
                 
                 should_send_keyframe = False
-
-                # 4. Final Send Condition: Turn happened + Motion Stabilized + Not Frozen + Not Currently Turning
                 if speak_start_flag and avg_motion < OPTICAL_FLOW_THRESH and frozen_flag == 0 and hand_status != 0 and not is_turn_detected:
                     should_send_keyframe = True
-                    # C++ does NOT reset speak_start_flag here. It persists until manually reset or session end.
-                    # speak_start_flag = False 
                     frozen_flag = OPTICAL_FLOW_HOLD_FRAME
                     detected_keyframes.append(frame_count)
 
-                # Decrement frozen flag
+                # Update pending data for CURRENT frame (to be written when next frame arrives)
+                # Store: Frame, Rdev, Ldev, *PoseData, KeyFrame
+                pending_log_data = [frame_count, r_dev, l_dev] + pose_data + [1 if should_send_keyframe else 0]
+
+                # Save Debug Frame (ROI Cropped)
+                if debug_frame_dir:
+                    try:
+                        video_stem = config.video_path.stem
+                        suffix = "_k" if should_send_keyframe else ""
+                        img_name = f"{video_stem}_{frame_count}{suffix}.jpg"
+                        img_path = debug_frame_dir / img_name
+                        cv2.imwrite(str(img_path), cv2.cvtColor(frame_image_rgb, cv2.COLOR_RGB2BGR))
+                    except Exception as e:
+                        logger.error(f"Failed to save debug frame: {e}")
+
                 if frozen_flag > 0:
                     frozen_flag -= 1
+                
+                # ... (rest of the visualization and encoding logic)
+
                 
                 # prev_gray update moved inside hand_status check to match C++
 
